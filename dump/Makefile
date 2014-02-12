@@ -92,9 +92,9 @@ LDIRT = $(LINKS)
 LLDLIBS = $(LIBUUID) $(LIBHANDLE) $(LIBATTR) $(LIBRMT)
 LTDEPENDENCIES = $(LIBRMT)
 
-LCFLAGS = -DDUMP -DRMT -DBASED -DDOSOCKS -DINVCONVFIX -DSIZEEST -DPIPEINVFIX
+LCFLAGS = -DDUMP
 
-default: $(LTCOMMAND)
+default: depend $(LTCOMMAND)
 
 include $(BUILDRULES)
 
@@ -105,8 +105,14 @@ install: default
 	$(INSTALL) -S $(PKG_ROOT_SBIN_DIR)/$(LTCOMMAND) $(PKG_SBIN_DIR)/$(LTCOMMAND)
 install-dev:
 
+.dep: $(COMMINCL) $(COMMON) $(INVINCL) $(INVCOMMON)
+
 $(COMMINCL) $(COMMON):
-	$(RM) $@; $(LN_S) ../common/$@ $@
+	@echo "    [LN]     $@"
+	$(Q)$(RM) $@; $(LN_S) ../common/$@ $@
 
 $(INVINCL) $(INVCOMMON):
-	$(RM) $@; $(LN_S) ../inventory/$@ $@
+	@echo "    [LN]     $@"
+	$(Q)$(RM) $@; $(LN_S) ../inventory/$@ $@
+
+-include .dep

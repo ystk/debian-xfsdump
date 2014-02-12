@@ -30,6 +30,7 @@
 
 #include "types.h"
 #include "qlock.h"
+#include "cldmgr.h"
 #include "ring.h"
 
 static int ring_slave_entry( void *ringctxp );
@@ -38,14 +39,13 @@ ring_t *
 ring_create( size_t ringlen,
 	     size_t bufsz,
 	     bool_t pinpr,
-	     void ( *threadfunc )( void *clientctxp,
-				   int ( * entry )( void *ringctxp ),
-				   void *ringctxp ),
+	     ix_t drive_index,
 	     int ( *readfunc )( void *clientctxp, char *bufp ),
 	     int ( *writefunc )( void *clientctxp, char *bufp ),
 	     void *clientctxp,
 	     intgen_t *rvalp )
 {
+	bool_t ok;
 	ring_t *ringp;
 	size_t mix;
 
@@ -122,7 +122,12 @@ ring_create( size_t ringlen,
 
 	/* kick off the slave thread
 	 */
-	( *threadfunc )( clientctxp, ring_slave_entry, ( void * )ringp );
+	ok = cldmgr_create( ring_slave_entry,
+			    CLONE_VM,
+			    drive_index,
+			    _("slave"),
+			    ringp );
+	ASSERT( ok );
 
 	return ringp;
 }
@@ -404,17 +409,19 @@ ring_slave_put( ring_t *ringp, ring_msg_t *msgp )
 static int
 ring_slave_entry( void *ringctxp )
 {
+	sigset_t blocked_set;
 	ring_t *ringp = ( ring_t * )ringctxp;
 	enum { LOOPMODE_NORMAL, LOOPMODE_IGNORE, LOOPMODE_DIE } loopmode;
 
-	/* ignore signals
+	/* block signals, let the main thread handle them
 	 */
-	sigset( SIGHUP, SIG_IGN );
-	sigset( SIGINT, SIG_IGN );
-	sigset( SIGQUIT, SIG_IGN );
-	sigset( SIGPIPE, SIG_IGN );
-	sigset( SIGALRM, SIG_IGN );
-	sigset( SIGCLD, SIG_IGN );
+	sigemptyset( &blocked_set );
+	sigaddset( &blocked_set, SIGINT );
+	sigaddset( &blocked_set, SIGHUP );
+	sigaddset( &blocked_set, SIGTERM );
+	sigaddset( &blocked_set, SIGQUIT );
+	sigaddset( &blocked_set, SIGALRM );
+	sigprocmask( SIG_SETMASK, &blocked_set, NULL );
 
 	/* record slave pid to be used to kill slave
 	 */

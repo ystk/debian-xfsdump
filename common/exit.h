@@ -25,6 +25,16 @@
 #define EXIT_INTERRUPT	2	/* interrupted (operator or device error) */
 #define EXIT_FAULT	4	/* code fault */
 
-typedef size_t exit_t;
+static inline const char *
+exit_codestring( intgen_t code )
+{
+	switch ( code ) {
+	case EXIT_NORMAL:    return "SUCCESS";
+	case EXIT_ERROR:     return "ERROR";
+	case EXIT_INTERRUPT: return "INTERRUPT";
+	case EXIT_FAULT:     return "FAULT";
+	}
+	return "UNKNOWN";
+}
 
 #endif /* EXIT_H */

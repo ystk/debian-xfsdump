@@ -42,28 +42,29 @@ extern size_t pgmask;
 
 /* macros for manipulating node handles when handle consistency
  * checking is enabled. the upper bits of a handle will be loaded
- * with the node gen count, described below.
+ * with the node gen count, described below. this should not be
+ * used for production code, it cuts into the number of dirents
+ * that xfsrestore can handle.
  */
 #define HDLGENCNT		4
 #define	HDLGENSHIFT		( NBBY * sizeof ( nh_t ) - HDLGENCNT )
 #define	HDLGENLOMASK		( ( 1 << HDLGENCNT ) - 1 )
 #define	HDLGENMASK		( HDLGENLOMASK << HDLGENSHIFT )
-#define HDLNIXCNT		HDLGENSHIFT
-#define HDLNIXMASK		( ( 1 << HDLNIXCNT ) - 1 )
+#define HDLMASK			( ( 1 << HDLGENSHIFT ) - 1 )
 #define HDLGETGEN( h )		( ( u_char_t )				\
 				  ( ( ( int )h >> HDLGENSHIFT )		\
 				    &					\
 				    HDLGENLOMASK ))
-#define HDLGETNIX( h )		( ( nix_t )( ( int )h & HDLNIXMASK ))
+#define HDLGETNHDL( h )		( ( nh_t )( ( int )h & HDLMASK ))
 #define HDLMKHDL( g, n )	( ( nh_t )( ( ( ( int )g << HDLGENSHIFT )\
 					      &				\
 					      HDLGENMASK )		\
 					  |				\
-					  ( ( int )n & HDLNIXMASK )))
-#define NIX_MAX			( ( off64_t )HDLNIXMASK )
+					  ( ( int )n & HDLMASK )))
+#define NH_MAX			( HDLMASK )
 
 /* the housekeeping byte of each node will hold two check fields:
- * a gen count, initialized to the node ix and incremented each time a node
+ * a gen count, initialized to 0 and incremented each time a node
  * is allocated, to catch re-use of stale handles; and unique pattern, to
  * differentiate a valid node from random memory. two unique patterns will
  * be used; one when the node is on the free list, another when it is
@@ -95,39 +96,20 @@ extern size_t pgmask;
 
 #else /* NODECHK */
 
-#define NIX_MAX			( ( ( off64_t )1			\
-				    <<					\
-				    ( ( off64_t )NBBY			\
-				      *					\
-				      ( off64_t )sizeof( nh_t )))	\
-				  -					\
-				  ( off64_t )2 ) /* 2 to avoid NH_NULL */
+#define NH_MAX			( NH_NULL - 1 )
 
 #endif /* NODECHK */
 
 /* window constraints
  */
-#define NODESPERSEGMIN	1000000
-
-/* how many nodes to place on free list at a time
- */
-#define VIRGSACRMAX	8192 /* fudged: 8192 48 byte nodes (24 or 96 pages) */
-
-/* a node is identified internally by its index into the backing store.
- * this index is the offset of the node into the segmented portion of
- * backing store (follows the abstraction header page) divided by the
- * size of a node. a special index is reserved to represent the null
- * index. a type is defined for node index (nix_t). it is a 64 bit
- * unsigned to facilitate conversion from index to 64 bit offset.
- */
-typedef off64_t nix_t;
-#define NIX_NULL OFF64MAX
-#define NIX2OFF( nix )	( nix * ( nix_t )node_hdrp->nh_nodesz )
-#define OFF2NIX( noff )	( noff / ( nix_t )node_hdrp->nh_nodesz )
+#define NODESPERSEG_MIN	1048576
+#define WINMAP_MIN	4
 
 /* reserve the firstpage for a header to save persistent context
  */
 #define NODE_HDRSZ	pgsz
+
+typedef intgen_t relnix_t;
 
 struct node_hdr {
 	size_t nh_nodesz;
@@ -137,16 +119,13 @@ struct node_hdr {
 		/* index of byte in each node the user has reserved
 		 * for use by me
 		 */
-	size_t nh_nodesperseg;
+	nh_t nh_nodesperseg;
 		/* an integral number of internal nodes must fit into a
 		 * segment
 		 */
-	size_t nh_segsz;
+	size64_t nh_segsz;
 		/* the backing store is partitoned into segment, which
 		 * can be mapped into VM windows  by the win abstraction
-		 */
-	size64_t nh_segtblsz;
-		/* the estimated size of the entire segment table.
 		 */
 	size_t nh_winmapmax;
 		/* maximum number of windows which can be mapped
@@ -154,27 +133,21 @@ struct node_hdr {
 	size_t nh_nodealignsz;
 		/* user's constraint on node alignment
 		 */
-	nix_t nh_freenix;
-		/* index into backing store of first node of singly-linked
-		 * list of free nodes
+	nh_t nh_freenh;
+		/* handle of first node of singly-linked list of free nodes
 		 */
 	off64_t nh_firstsegoff;
 		/* offset into backing store of the first segment
 		 */
-	off64_t nh_virgsegreloff;
-		/* offset (relative to beginning of first segment) into
-		 * backing store of segment containing one or
-		 * more virgin nodes. relative to beginning of segmented
-		 * portion of backing store. bumped only when all of the
-		 * nodes in the segment have been placed on the free list.
-		 * when bumped, nh_virginrelnix is simultaneously set back
-		 * to zero.
+	nh_t nh_virgnh;
+		/* handle of next virgin node
 		 */
-	nix_t nh_virgrelnix;
-		/* relative node index within the segment identified by
-		 * nh_virgsegreloff of the next node not yet placed on the
-		 * free list. never reaches nh_nodesperseg: instead set
-		 * to zero and bump nh_virgsegreloff by one segment.
+	intgen_t nh_segixshift;
+		/* bitshift used to extract the segment index from an nh_t
+		 */
+	relnix_t nh_relnixmask;
+		/* bitmask used to extract the node index from an nh_t
+		 * (relative to the start of a segment)
 		 */
 };
 
@@ -182,6 +155,73 @@ typedef struct node_hdr node_hdr_t;
 
 static node_hdr_t *node_hdrp;
 static intgen_t node_fd;
+
+static inline segix_t
+nh2segix( nh_t nh )
+{
+	return nh >> node_hdrp->nh_segixshift;
+}
+
+static inline relnix_t
+nh2relnix( nh_t nh )
+{
+	return nh & node_hdrp->nh_relnixmask;
+}
+
+static inline void
+node_map_internal( nh_t nh, void **pp )
+{
+	win_map( nh2segix( nh ), pp );
+	if ( *pp != NULL ) {
+		relnix_t relnix = nh2relnix( nh );
+		*pp = ( void * )( ( char * )( *pp ) +
+				( ( off64_t )relnix *
+				  node_hdrp->nh_nodesz ) );
+	}
+}
+
+/* ARGSUSED */
+static inline void
+node_unmap_internal( nh_t nh, void **pp, bool_t freepr )
+{
+#ifdef NODECHK
+	register u_char_t hkp;
+	register u_char_t hdlgen;
+	register u_char_t nodegen;
+	register u_char_t nodeunq;
+#endif /* NODECHK */
+
+	ASSERT( pp );
+	ASSERT( *pp );
+	ASSERT( nh != NH_NULL );
+
+	/* convert the handle into an index
+	 */
+#ifdef NODECHK
+	hdlgen = HDLGETGEN( nh );
+	nh = HDLGETNHDL( nh );
+#endif /* NODECHK */
+
+	ASSERT( nh <= NH_MAX );
+
+#ifdef NODECHK
+	hkp = *( *( u_char_t ** )pp + node_hdrp->nh_nodehkix );
+	nodegen = HKPGETGEN( hkp );
+	ASSERT( nodegen == hdlgen );
+	nodeunq = HKPGETUNQ( hkp );
+	if ( ! freepr ) {
+		ASSERT( nodeunq != NODEUNQFREE );
+		ASSERT( nodeunq == NODEUNQALCD );
+	} else {
+		ASSERT( nodeunq != NODEUNQALCD );
+		ASSERT( nodeunq == NODEUNQFREE );
+	}
+#endif /* NODECHK */
+
+	/* unmap the window containing the node
+	 */
+	win_unmap( nh2segix( nh ), pp ); /* zeros *pp */
+}
 
 /* ARGSUSED */
 bool_t
@@ -193,19 +233,20 @@ node_init( intgen_t fd,
 	   size64_t vmsz,
 	   size64_t dirs_nondirs_cnt )
 {
-	size64_t nodesz;
-	size64_t winmap_mem;
+	size_t nodesz;
 	size64_t segsz;
-	size64_t segtablesz;
-	size64_t nodesperseg;
-	size64_t minsegsz;
-	size64_t winmapmax;
-	intgen_t rval;
+	nh_t nodesperseg;
+	size_t max_segments;
+	size_t winmapmax;
+	size_t segcount;
+	intgen_t segixshift;
 
 	/* sanity checks
 	 */
 	ASSERT( sizeof( node_hdr_t ) <= NODE_HDRSZ );
 	ASSERT( sizeof( nh_t ) < sizeof( off64_t ));
+	ASSERT( sizeof( nh_t ) <= sizeof( segix_t ));
+	ASSERT( sizeof( nh_t ) <= sizeof( relnix_t ));
 	ASSERT( nodehkix < usrnodesz );
 	ASSERT( usrnodesz >= sizeof( char * ) + 1 );
 		/* so node is at least big enough to hold
@@ -220,36 +261,76 @@ node_init( intgen_t fd,
 	*/
 	nodesz = ( usrnodesz + nodealignsz - 1 ) & ~( nodealignsz - 1 );
 
-#define	WINMAP_MAX	20	/* maximum number of windows to use */
-#define	WINMAP_MIN	4	/* minimum number of windows to use */
-#define	HARDLINK_FUDGE	1.2	/* approx 1.2 hard links per file */
-
-	/* Calculate the expected size of the segment table using the number
-	 * of dirs and non-dirs.  Since we don't know how many hard-links
-	 * there will be, scale the size upward using HARDLINK_FUDGE.
+	/* Calculate the node table params based on the number of inodes in the
+	 * dump, since that's all we know. Ideally we'd base this on the number
+	 * of dirents in the dump instead as there's a node per dirent.
+	 *
+	 * Due to virtual memory constraints and the fact that we don't know
+	 * the final node table size, we can't guarantee that the entire node
+	 * table can be mapped at once. Instead segments will be mapped using a
+	 * window abstraction. Some operations require WINMAP_MIN nodes to be
+	 * referenced at a time, therefore we must ensure that this many
+	 * segments fit in virtual memory.
+	 *
+	 * nodesperseg must be a power of two. Earlier versions did not enforce
+	 * this, and profiling showed that nearly 50% of cpu time during the
+	 * node table construction was consumed doing division and modulo to
+	 * convert an nh_t to a segment index and node offset.  By making
+	 * nodesperseg a power of two we can use shift and bitwise-and instead.
+	 *
+	 * Each segment must hold an integral number of nodes and be an integral
+	 * number of pages. #1 ensures this except when nodesperseg is small, so
+	 * the smallest allowed segsz is pgsz * nodesz (i.e., nodesperseg ==
+	 * pgsz). However this is of no consequence as we enforce a larger
+	 * minimum nodesperseg (NODESPERSEG_MIN) anyway in order to place a
+	 * reasonable cap on the max number of segments.
 	 */
 
-	segtablesz = ( (size64_t)(HARDLINK_FUDGE * (double)dirs_nondirs_cnt) * nodesz);
+	ASSERT( NODESPERSEG_MIN >= pgsz );
 
-	/* Figure out how much memory is available for use by winmaps, and
-	 * use that to pick an appropriate winmapmax, segsz, and nodesperseg,
-	 * the goal being that if at all possible we want the entire segment
-	 * table to be mapped so that we aren't constantly mapping and
-	 * unmapping winmaps.  There must be at least WINMAP_MIN winmaps
-	 * because references can be held on more than one winmap at the
-	 * same time.  More winmaps are generally better to reduce the
-	 * number of nodes that are unmapped if unmapping does occur.
+	if ( vmsz < WINMAP_MIN * NODESPERSEG_MIN * nodesz ) {
+		mlog( MLOG_NORMAL | MLOG_ERROR, _(
+		  "not enough virtual memory for node abstraction: "
+		  "remaining-vsmz=%llu need=%llu\n"),
+		  vmsz, WINMAP_MIN * NODESPERSEG_MIN * nodesz );
+		return BOOL_FALSE;
+	}
+
+	/* This is checked as nodes are allocated as well (remember that
+	 * dirs_nondirs_cnt may be less than the number of nodes/dirents).
+	 * Checking this here prevents potential overflow in the logic below.
 	 */
+	if ( dirs_nondirs_cnt > NH_MAX ) {
+		mlog( MLOG_NORMAL | MLOG_ERROR, _(
+		  "dump contains %llu inodes, restore can only handle %u\n"),
+		  dirs_nondirs_cnt, NH_MAX );
+		return BOOL_FALSE;
+	}
 
-	minsegsz = pgsz * nodesz;	/* must be pgsz and nodesz multiple */
-	winmap_mem = min(vmsz, segtablesz);
-	segsz = (((winmap_mem / WINMAP_MAX) + minsegsz - 1) / minsegsz) * minsegsz;
-	segsz = max(segsz, minsegsz);
+	for ( winmapmax = 0, segcount = 1; winmapmax < WINMAP_MIN; segcount <<= 1 ) {
 
-	nodesperseg = segsz / nodesz;
+		nodesperseg = max( dirs_nondirs_cnt / segcount, NODESPERSEG_MIN );
 
-	winmapmax = min(WINMAP_MAX, vmsz / segsz);
-	winmapmax = max(winmapmax, WINMAP_MIN);
+		/* nodesperseg must be a power of 2 */
+		for ( segixshift = 0;
+		      ( 1ULL << segixshift ) < nodesperseg;
+		      segixshift++ );
+
+		/* rounding up to a power of 2 may have caused overflow */
+		if ( ( 1ULL << segixshift ) > NH_MAX )
+			segixshift--;
+
+		nodesperseg = 1UL << segixshift;
+
+		max_segments = 1UL << ( NBBY * sizeof(nh_t) - segixshift );
+
+		segsz = nodesperseg * nodesz;
+
+		/* max number of segments that will fit in virtual memory,
+		 * capped at the max possible number of segments
+		 */
+		winmapmax = min( vmsz / segsz, max_segments );
+	}
 
 	/* map the abstraction header
 	 */
@@ -274,44 +355,24 @@ node_init( intgen_t fd,
 	node_hdrp->nh_nodesz = nodesz;
 	node_hdrp->nh_nodehkix = nodehkix;
 	node_hdrp->nh_segsz = segsz;
-	node_hdrp->nh_segtblsz = segtablesz;
 	node_hdrp->nh_winmapmax = winmapmax;
 	node_hdrp->nh_nodesperseg = nodesperseg;
 	node_hdrp->nh_nodealignsz = nodealignsz;
-	node_hdrp->nh_freenix = NIX_NULL;
+	node_hdrp->nh_freenh = NH_NULL;
 	node_hdrp->nh_firstsegoff = off + ( off64_t )NODE_HDRSZ;
-	node_hdrp->nh_virgsegreloff = 0;
-	node_hdrp->nh_virgrelnix = 0;
+	node_hdrp->nh_virgnh = 0;
+	node_hdrp->nh_segixshift = segixshift;
+	node_hdrp->nh_relnixmask = nodesperseg - 1;
 
 	/* save transient context
 	 */
 	node_fd = fd;
-
-	/* autogrow the first segment
-	 */
-	mlog( MLOG_DEBUG,
-	      "pre-growing new node array segment at %lld "
-	      "size %lld\n",
-	      node_hdrp->nh_firstsegoff,
-	      ( off64_t )node_hdrp->nh_segsz );
-	rval = ftruncate64( node_fd,
-			    node_hdrp->nh_firstsegoff
-			    +
-			    ( off64_t )node_hdrp->nh_segsz );
-	if ( rval ) {
-		mlog( MLOG_NORMAL | MLOG_ERROR | MLOG_TREE, _(
-		      "unable to autogrow first node segment: %s (%d)\n"),
-		      strerror( errno ),
-		      errno );
-		return BOOL_FALSE;
-	}
 
 	/* initialize the window abstraction
 	 */
 	win_init( fd,
 		  node_hdrp->nh_firstsegoff,
 		  segsz,
-		  segtablesz,
 		  winmapmax );
 	
 	/* announce the results
@@ -319,14 +380,12 @@ node_init( intgen_t fd,
 	mlog( MLOG_DEBUG | MLOG_TREE,
 	      "node_init:"
 	      " vmsz = %llu (0x%llx)"
-	      " segsz = %u (0x%x)"
-	      " segtblsz = %llu (0x%llx)"
+	      " segsz = %llu (0x%llx)"
 	      " nodesperseg = %u (0x%x)"
-	      " winmapmax = %llu (0x%llx)"
+	      " winmapmax = %lu (0x%lx)"
 	      "\n",
 	      vmsz, vmsz,
 	      segsz, segsz,
-	      segtablesz, segtablesz,
 	      nodesperseg, nodesperseg,
 	      winmapmax, winmapmax );
 
@@ -366,7 +425,6 @@ node_sync( intgen_t fd, off64_t off )
 	win_init( fd,
 		  node_hdrp->nh_firstsegoff,
 		  node_hdrp->nh_segsz,
-		  node_hdrp->nh_segtblsz,
 		  node_hdrp->nh_winmapmax );
 
 	return BOOL_TRUE;
@@ -375,166 +433,92 @@ node_sync( intgen_t fd, off64_t off )
 nh_t
 node_alloc( void )
 {
-	nix_t nix;
 	u_char_t *p;
 	nh_t nh;
-	register nix_t *linkagep;
 #ifdef NODECHK
-	register u_char_t *hkpp;
-	register u_char_t gen;
-	register u_char_t unq;
+	u_char_t *hkpp;
+	u_char_t gen = 0;
+	u_char_t unq;
 #endif /* NODECHK */
 
-	/* if free list is depleted, map in a new window at the
-	 * end of backing store. put all nodes on free list.
-	 * initialize the gen count to the node index, and the unique
-	 * pattern to the free pattern.
+	/* if there's a node available on the free list, use it.
+	 * otherwise get the next one from the current virgin segment,
+	 * or allocate a new virgin segment if the current one is depleted.
 	 */
-	if ( node_hdrp->nh_freenix == NIX_NULL ) {
-		nix_t virgbegnix; /* abs. nix of first node in virg seg */
-		nix_t virgendnix; /* abs. nix of next node after last */
-		nix_t sacrcnt; /* how many virgins to put on free list */
-		nix_t sacrnix; 
+	if ( node_hdrp->nh_freenh != NH_NULL ) {
+		nh_t *linkagep;
 
-		ASSERT( node_hdrp->nh_virgrelnix
-			<
-			( nix_t )node_hdrp->nh_nodesperseg );
-		virgbegnix = OFF2NIX( node_hdrp->nh_virgsegreloff )
-			     +
-			     node_hdrp->nh_virgrelnix;
-		virgendnix =
-		      OFF2NIX( ( node_hdrp->nh_virgsegreloff
-			       +
-			       ( off64_t )node_hdrp->nh_segsz ) );
-#ifdef TREE_DEBUG
-		mlog(MLOG_DEBUG | MLOG_TREE,
-		   "node_alloc(): create freelist - "
-		   "virg_begin=%lld virg_end=%lld\n",
-		   virgbegnix, virgendnix); 
-#endif
-		ASSERT( virgendnix > virgbegnix );
-		sacrcnt = min( VIRGSACRMAX, virgendnix - virgbegnix );
-		ASSERT( sacrcnt >= 1 );
-		p = 0; /* keep lint happy */
-		win_map( NIX2OFF( virgbegnix ), ( void ** )&p );
+		nh = node_hdrp->nh_freenh;
+
+		node_map_internal( nh, ( void ** )&p );
 		if (p == NULL)
-		    return NH_NULL;
-		node_hdrp->nh_freenix = virgbegnix;
-		for ( sacrnix = virgbegnix
-		      ;
-		      sacrnix < virgbegnix + sacrcnt - 1
-		      ;
-		      p += node_hdrp->nh_nodesz, sacrnix++ ) {
-			linkagep = ( nix_t * )p;
-			*linkagep = sacrnix + 1;
-#ifdef NODECHK
-			hkpp = p + node_hdrp->nh_nodehkix;
-			gen = ( u_char_t )sacrnix;
-			*hkpp = ( u_char_t )HKPMKHKP( ( size_t )gen,
-						      NODEUNQFREE );
-#endif /* NODECHK */
-		}
-		linkagep = ( nix_t * )p;
-		*linkagep = NIX_NULL;
+			return NH_NULL;
 #ifdef NODECHK
 		hkpp = p + node_hdrp->nh_nodehkix;
-		gen = ( u_char_t )sacrnix;
-		*hkpp = HKPMKHKP( gen, NODEUNQFREE );
+		gen = ( u_char_t )( HKPGETGEN( *p ) + ( u_char_t )1 );
+		unq = HKPGETUNQ( *hkpp );
+		ASSERT( unq != NODEUNQALCD );
+		ASSERT( unq == NODEUNQFREE );
 #endif /* NODECHK */
-		node_hdrp->nh_virgrelnix += sacrcnt;
-		win_unmap( node_hdrp->nh_virgsegreloff, ( void ** )&p );
 
-		if ( node_hdrp->nh_virgrelnix
-		     >=
-		     ( nix_t )node_hdrp->nh_nodesperseg ) {
+		/* adjust the free list */
+		linkagep = ( nh_t * )p;
+		node_hdrp->nh_freenh = *linkagep;
+
+		node_unmap_internal( nh, ( void ** )&p, BOOL_TRUE );
+
+	} else {
+		if ( nh2relnix( node_hdrp->nh_virgnh ) == 0 ) {
+			/* need to start a new virgin segment */
 			intgen_t rval;
-			ASSERT( node_hdrp->nh_virgrelnix
-				==
-				( nix_t )node_hdrp->nh_nodesperseg );
-			ASSERT( node_hdrp->nh_virgsegreloff
+			off64_t new_seg_off =
+				node_hdrp->nh_firstsegoff +
+				( off64_t )nh2segix( node_hdrp->nh_virgnh ) *
+				( off64_t )node_hdrp->nh_segsz;
+
+			ASSERT( new_seg_off
 				<=
 				OFF64MAX - ( off64_t )node_hdrp->nh_segsz );
-#ifdef TREE_DEBUG
-			mlog(MLOG_DEBUG | MLOG_TREE,
-			    "node_alloc(): runout of nodes for freelist in "
-                            "this segment - nodes used = %lld\n", 
-                            node_hdrp->nh_virgrelnix);
-#endif
-			node_hdrp->nh_virgsegreloff +=
-					( off64_t )node_hdrp->nh_segsz;
-			node_hdrp->nh_virgrelnix = 0;
 			mlog( MLOG_DEBUG,
 			      "pre-growing new node array segment at %lld "
 			      "size %lld\n",
-			      node_hdrp->nh_firstsegoff 
-			      +
-			      node_hdrp->nh_virgsegreloff
-			      +
-			      ( off64_t )node_hdrp->nh_segsz,
+			      new_seg_off,
 			      ( off64_t )node_hdrp->nh_segsz );
 			rval = ftruncate64( node_fd,
-					    node_hdrp->nh_firstsegoff 
-					    +
-					    node_hdrp->nh_virgsegreloff
+					    new_seg_off
 					    +
 					    ( off64_t )node_hdrp->nh_segsz );
 			if ( rval ) {
 				mlog( MLOG_NORMAL | MLOG_WARNING | MLOG_TREE, _(
-				      "unable to autogrow node segment %llu: "
+				      "unable to autogrow node segment %u: "
 				      "%s (%d)\n"),
-				      node_hdrp->nh_virgsegreloff
-				      /
-				      ( off64_t )node_hdrp->nh_segsz,
+				      nh2segix( node_hdrp->nh_virgnh ),
 				      strerror( errno ),
 				      errno );
 			}
 		}
+
+		nh = node_hdrp->nh_virgnh++;
 	}
-
-	/* map in window containing node at top of free list,
-	 * and adjust free list.
-	 */
-	nix = node_hdrp->nh_freenix;
-#ifdef TREE_DEBUG
-	mlog(MLOG_DEBUG | MLOG_TREE,
-	   "node_alloc(): win_map(%llu) and get head from node freelist\n",
-           NIX2OFF(nix));
-#endif
-	win_map( NIX2OFF( nix ), ( void ** )&p );
-	if (p == NULL)
-	    return NH_NULL;
-#ifdef NODECHK
-	hkpp = p + node_hdrp->nh_nodehkix;
-	unq = HKPGETUNQ( *hkpp );
-	ASSERT( unq != NODEUNQALCD );
-	ASSERT( unq == NODEUNQFREE );
-#endif /* NODECHK */
-	linkagep = ( nix_t * )p;
-	node_hdrp->nh_freenix = *linkagep;
-
-	/* clean the node
-	 */
-	memset( ( void * )p, 0, node_hdrp->nh_nodesz );
 
 	/* build a handle for node
 	 */
-	ASSERT( nix <= NIX_MAX );
+	if ( nh > NH_MAX ) {
+		mlog( MLOG_NORMAL | MLOG_ERROR, _(
+		  "dump contains too many dirents, "
+		  "restore can only handle %llu\n"),
+		  NH_MAX );
+		return NH_NULL;
+	}
 #ifdef NODECHK
+	node_map_internal( nh , ( void ** )&p );
+	if (p == NULL)
+		abort();
 	hkpp = p + ( int )node_hdrp->nh_nodehkix;
-	gen = ( u_char_t )( HKPGETGEN( *p ) + ( u_char_t )1 );
-	nh = HDLMKHDL( gen, nix );
+	nh = HDLMKHDL( gen, nh );
 	*hkpp = HKPMKHKP( gen, NODEUNQALCD );
-#else /* NODECHK */
-	nh = ( nh_t )nix;
+	node_unmap_internal( nh, ( void ** )&p, BOOL_FALSE );
 #endif /* NODECHK */
-
-	/* unmap window
-	 */
-#ifdef TREE_DEBUG
-	mlog(MLOG_DEBUG | MLOG_TREE,
-	   "node_alloc(): win_unmap(%llu)\n", NIX2OFF(nix));
-#endif
-	win_unmap( NIX2OFF( nix ), ( void ** )&p );
 
 	return nh;
 }
@@ -542,7 +526,6 @@ node_alloc( void )
 void *
 node_map( nh_t nh )
 {
-	nix_t nix;
 	u_char_t *p;
 #ifdef NODECHK
 	register u_char_t hkp;
@@ -557,17 +540,15 @@ node_map( nh_t nh )
 	 */
 #ifdef NODECHK
 	hdlgen = HDLGETGEN( nh );
-	nix = HDLGETNIX( nh );
-#else /* NODECHK */
-	nix = ( nix_t )nh;
+	nh = HDLGETNHDL( nh );
 #endif /* NODECHK */
 
-	ASSERT( nix <= NIX_MAX );
+	ASSERT( nh <= NH_MAX );
 
 	/* map in
 	 */
 	p = 0; /* keep lint happy */
-	win_map( NIX2OFF( nix ), ( void ** )&p );
+	node_map_internal( nh, ( void ** )&p );
 	if (p == NULL)
 	    return NULL;
 
@@ -583,52 +564,6 @@ node_map( nh_t nh )
 	return ( void * )p;
 }
 
-/* ARGSUSED */
-static void
-node_unmap_internal( nh_t nh, void **pp, bool_t internalpr )
-{
-	nix_t nix;
-#ifdef NODECHK
-	register u_char_t hkp;
-	register u_char_t hdlgen;
-	register u_char_t nodegen;
-	register u_char_t nodeunq;
-#endif /* NODECHK */
-
-	ASSERT( pp );
-	ASSERT( *pp );
-	ASSERT( nh != NH_NULL );
-
-	/* convert the handle into an index
-	 */
-#ifdef NODECHK
-	hdlgen = HDLGETGEN( nh );
-	nix = HDLGETNIX( nh );
-#else /* NODECHK */
-	nix = ( nix_t )nh;
-#endif /* NODECHK */
-
-	ASSERT( nix <= NIX_MAX );
-
-#ifdef NODECHK
-	hkp = *( *( u_char_t ** )pp + node_hdrp->nh_nodehkix );
-	nodegen = HKPGETGEN( hkp );
-	ASSERT( nodegen == hdlgen );
-	nodeunq = HKPGETUNQ( hkp );
-	if ( ! internalpr ) {
-		ASSERT( nodeunq != NODEUNQFREE );
-		ASSERT( nodeunq == NODEUNQALCD );
-	} else {
-		ASSERT( nodeunq != NODEUNQALCD );
-		ASSERT( nodeunq == NODEUNQFREE );
-	}
-#endif /* NODECHK */
-
-	/* unmap the window containing the node
-	 */
-	win_unmap( NIX2OFF( nix ), pp ); /* zeros *pp */
-}
-
 void
 node_unmap( nh_t nh, void **pp )
 {
@@ -639,9 +574,8 @@ void
 node_free( nh_t *nhp )
 {
 	nh_t nh;
-	nix_t nix;
 	u_char_t *p;
-	register nix_t *linkagep;
+	register nh_t *linkagep;
 #ifdef NODECHK
 	register u_char_t *hkpp;
 	register u_char_t hdlgen;
@@ -657,12 +591,10 @@ node_free( nh_t *nhp )
 	 */
 #ifdef NODECHK
 	hdlgen = HDLGETGEN( nh );
-	nix = HDLGETNIX( nh );
-#else /* NODECHK */
-	nix = ( nix_t )nh;
+	nh = HDLGETNHDL( nh );
 #endif /* NODECHK */
 
-	ASSERT( nix <= NIX_MAX );
+	ASSERT( nh <= NH_MAX );
 
 	/* map in
 	 */
@@ -686,9 +618,9 @@ node_free( nh_t *nhp )
 
 	/* put node on free list
 	 */
-	linkagep = ( nix_t * )p;
-	*linkagep = node_hdrp->nh_freenix;
-	node_hdrp->nh_freenix = nix;
+	linkagep = ( nh_t * )p;
+	*linkagep = node_hdrp->nh_freenh;
+	node_hdrp->nh_freenh = nh;
 
 	/* map out
 	 */

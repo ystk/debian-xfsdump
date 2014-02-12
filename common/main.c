@@ -100,7 +100,6 @@ static bool_t set_rlimits( void );
 #ifdef RESTORE
 static bool_t set_rlimits( size64_t * );
 #endif /* RESTORE */
-static char *exit_codestring( intgen_t code );
 static char *sig_numstring( intgen_t num );
 static char *strpbrkquotes( char *p, const char *sep );
 
@@ -135,7 +134,6 @@ static time32_t stop_deadline;
 static bool_t stop_in_progress;
 static bool_t sighup_received;
 static bool_t sigterm_received;
-static bool_t sigpipe_received;
 static bool_t sigquit_received;
 static bool_t sigint_received;
 static size_t prbcld_cnt;
@@ -168,6 +166,7 @@ main( int argc, char *argv[] )
 	bool_t coredump_requested = BOOL_FALSE;
 	intgen_t exitcode;
 	rlim64_t tmpstacksz;
+	struct sigaction sa;
 	bool_t ok;
 	/* REFERENCED */
 	int rval;
@@ -484,7 +483,6 @@ main( int argc, char *argv[] )
 	 */
 	ok = drive_init1( argc, argv, miniroot );
 	if ( ! ok ) {
-		cldmgr_killall( );
 		return mlog_exit(EXIT_ERROR, RV_INIT);
 	}
 
@@ -547,31 +545,48 @@ main( int argc, char *argv[] )
 	 * be released at pre-emption points and upon pausing in the main
 	 * loop.
 	 */
+
+	sigfillset(&sa.sa_mask);
+	sa.sa_flags = 0;
+
+	/* always ignore SIGPIPE, instead handle EPIPE as part
+	 * of normal sys call error handling.
+	 *
+	 * explicitly ignore SIGCHLD so that if librmt rsh sessions
+	 * exit early they do not become zombies.
+	 */
+	sa.sa_handler = SIG_IGN;
+	sigaction( SIGPIPE, &sa, NULL );
+	sigaction( SIGCHLD, &sa, NULL );
+
 	if ( ! miniroot && ! pipeline ) {
+		sigset_t blocked_set;
+
 		stop_in_progress = BOOL_FALSE;
 		coredump_requested = BOOL_FALSE;
 		sighup_received = BOOL_FALSE;
 		sigterm_received = BOOL_FALSE;
 		sigint_received = BOOL_FALSE;
-		sigpipe_received = BOOL_FALSE;
 		sigquit_received = BOOL_FALSE;
 		sigstray_received = BOOL_FALSE;
 		prbcld_cnt = 0;
-		sigset( SIGINT, sighandler );
-		sighold( SIGINT );
-		sigset( SIGHUP, sighandler );
-		sighold( SIGHUP );
-		sigset( SIGTERM, sighandler );
-		sighold( SIGTERM );
-		sigset( SIGPIPE, sighandler );
-		sighold( SIGPIPE );
-		sigset( SIGQUIT, sighandler );
-		sighold( SIGQUIT );
+
 		alarm( 0 );
-		sigset( SIGALRM, sighandler );
-		sighold( SIGALRM );
-		sigset( SIGCLD, sighandler );
-		sighold( SIGCLD );
+
+		sigemptyset( &blocked_set );
+		sigaddset( &blocked_set, SIGINT );
+		sigaddset( &blocked_set, SIGHUP );
+		sigaddset( &blocked_set, SIGTERM );
+		sigaddset( &blocked_set, SIGQUIT );
+		sigaddset( &blocked_set, SIGALRM );
+		sigprocmask( SIG_SETMASK, &blocked_set, NULL );
+
+		sa.sa_handler = sighandler;
+		sigaction( SIGINT, &sa, NULL );
+		sigaction( SIGHUP, &sa, NULL );
+		sigaction( SIGTERM, &sa, NULL );
+		sigaction( SIGQUIT, &sa, NULL );
+		sigaction( SIGALRM, &sa, NULL );
 	}
 
 	/* do content initialization.
@@ -583,7 +598,6 @@ main( int argc, char *argv[] )
 	ok = content_init( argc, argv, vmsz / VMSZ_PER );
 #endif /* RESTORE */
 	if ( ! ok ) {
-		cldmgr_killall( );
 		return mlog_exit(EXIT_ERROR, RV_INIT);
 	}
 
@@ -593,10 +607,11 @@ main( int argc, char *argv[] )
 	if ( miniroot || pipeline ) {
 		intgen_t exitcode;
 
-		sigset( SIGINT, sighandler );
-		sigset( SIGHUP, sighandler );
-		sigset( SIGTERM, sighandler );
-		sigset( SIGPIPE, sighandler );
+		sa.sa_handler = sighandler;
+		sigaction( SIGINT, &sa, NULL );
+		sigaction( SIGHUP, &sa, NULL );
+		sigaction( SIGTERM, &sa, NULL );
+		sigaction( SIGQUIT, &sa, NULL );
 
 		ok = drive_init2( argc,
 				  argv,
@@ -688,6 +703,7 @@ main( int argc, char *argv[] )
 		time32_t now;
 		bool_t stop_requested = BOOL_FALSE;
 		intgen_t stop_timeout = -1;
+		sigset_t empty_set;
 
 		/* if there was an initialization error,
 		 * immediately stop all children.
@@ -804,16 +820,6 @@ main( int argc, char *argv[] )
 			sigterm_received = BOOL_FALSE;
 		}
 
-		/* request a stop on loss of write pipe
-		 */
-		if ( sigpipe_received ) {
-			mlog( MLOG_DEBUG | MLOG_PROC,
-			      "SIGPIPE received\n" );
-			stop_requested = BOOL_TRUE;
-			stop_timeout = STOP_TIMEOUT;
-			sigpipe_received = BOOL_FALSE;
-		}
-		
 		/* operator send SIGQUIT. treat like an interrupt,
 		 * but force a core dump
 		 */
@@ -886,20 +892,8 @@ main( int argc, char *argv[] )
 
 		/* sleep until next signal
 		 */
-		sigrelse( SIGINT );
-		sigrelse( SIGHUP );
-		sigrelse( SIGTERM );
-		sigrelse( SIGPIPE );
-		sigrelse( SIGQUIT );
-		sigrelse( SIGALRM );
-		( void )sigpause( SIGCLD );
-		sighold( SIGCLD );
-		sighold( SIGALRM );
-		sighold( SIGQUIT );
-		sighold( SIGPIPE );
-		sighold( SIGTERM );
-		sighold( SIGHUP );
-		sighold( SIGINT );
+		sigemptyset( &empty_set );
+		sigsuspend( &empty_set );
 		( void )alarm( 0 );
 	}
 
@@ -907,18 +901,9 @@ main( int argc, char *argv[] )
 	 */
 	if ( coredump_requested ) {
 		mlog( MLOG_DEBUG | MLOG_PROC,
-		      "killing all remaining children\n" );
-		cldmgr_killall( );
-		sleep( 1 );
-		mlog( MLOG_DEBUG | MLOG_PROC,
-		      "parent sending SIGQUIT to self (pid %d)\n",
+		      "core dump requested, aborting (pid %d)\n",
 		      parentpid );
-		sigrelse( SIGQUIT );
-		sigset( SIGQUIT, SIG_DFL );
-		kill( parentpid, SIGQUIT );
-		for ( ; ; ) {
-			sleep( 1 );
-		}
+		abort();
 	}
 
 	/* determine if dump or restore was interrupted
@@ -985,9 +970,7 @@ usage( void )
 	ULO(_("<verbosity {silent, verbose, trace}>"),	GETOPT_VERBOSITY );
 	ULO(_("<maximum file size>"),			GETOPT_MAXDUMPFILESIZE );
 	ULO(_("(don't dump extended file attributes)"),	GETOPT_NOEXTATTR );
-#ifdef BASED
 	ULO(_("<base dump session id>"),		GETOPT_BASED );
-#endif /* BASED */
 #ifdef REVEAL
 	ULO(_("(generate tape record checksums)"),	GETOPT_RECCHKSUM );
 #endif /* REVEAL */
@@ -1058,9 +1041,7 @@ usage( void )
 #ifdef REVEAL
 	ULO(_("(pin down I/O buffers)"),		GETOPT_RINGPIN );
 #endif /* REVEAL */
-#ifdef SESSCPLT
 	ULO(_("(force interrupted session completion)"),GETOPT_SESSCPLT );
-#endif /* SESSCPLT */
 	ULO(_("(resume)"),				GETOPT_RESUME );
 	ULO(_("<session id>"),				GETOPT_SESSIONID );
 	ULO(_("(don't timeout dialogs)"),		GETOPT_NOTIMEOUTS );
@@ -1091,6 +1072,10 @@ bool_t
 preemptchk( int flg )
 {
 	bool_t preempt_requested;
+	int i;
+	int sigs[] = { SIGINT, SIGHUP, SIGTERM, SIGQUIT };
+	int num_sigs = sizeof(sigs) / sizeof(sigs[0]);
+	sigset_t pending_set, handle_set;
 
 	/* see if a progress report needed
 	 */
@@ -1127,17 +1112,14 @@ preemptchk( int flg )
 	/* release signals momentarily to let any pending ones
 	 * invoke signal handler and set flags
 	 */
-	sigrelse( SIGINT );
-	sigrelse( SIGHUP );
-	sigrelse( SIGTERM );
-	sigrelse( SIGPIPE );
-	sigrelse( SIGQUIT );
-
-	sighold( SIGQUIT );
-	sighold( SIGPIPE );
-	sighold( SIGTERM );
-	sighold( SIGHUP );
-	sighold( SIGINT );
+	sigpending( &pending_set );
+	for ( i = 0; i < num_sigs; i++ ) {
+		if ( sigismember( &pending_set, sigs[i] ) == 1 ) {
+			sigfillset( &handle_set );
+			sigdelset( &handle_set, sigs[i] );
+			sigsuspend( &handle_set );
+		}
+	}
 
 	preempt_requested = BOOL_FALSE;
 
@@ -1170,13 +1152,6 @@ preemptchk( int flg )
 		sigterm_received = BOOL_FALSE;
 	}
 
-	if ( sigpipe_received ) {
-		mlog( MLOG_DEBUG | MLOG_PROC,
-		      "SIGPIPE received\n" );
-		preempt_requested = BOOL_TRUE;
-		sigpipe_received = BOOL_FALSE;
-	}
-	
 	if ( sigquit_received ) {
 		mlog( MLOG_DEBUG | MLOG_PROC,
 		      "SIGQUIT received (preempt)\n" );
@@ -1512,10 +1487,10 @@ mrh_sighandler( int signo )
 static void
 sighandler( int signo )
 {
-	/* get the pid and stream index
+	/* dialog gets first crack at the signal
 	 */
-	pid_t pid = getpid( );
-	intgen_t stix = stream_getix( pid );
+	if ( dlog_sighandler( signo ) )
+		return;
 
 	/* if in miniroot, don't do anything risky. just quit.
 	 */
@@ -1536,133 +1511,34 @@ sighandler( int signo )
 		exit( rval );
 	}
 
-	/* if death of a child of a child, bury the child and return.
-	 * probably rmt.
-	 */
-	if ( pid != parentpid && signo == SIGCLD ) {
-		intgen_t stat;
-		( void )wait( &stat );
-		( void )sigset( signo, sighandler );
-		return;
+	switch ( signo ) {
+	case SIGHUP:
+		/* immediately disable further dialogs
+		*/
+		dlog_desist( );
+		sighup_received = BOOL_TRUE;
+		break;
+	case SIGTERM:
+		/* immediately disable further dialogs
+		*/
+		dlog_desist( );
+		sigterm_received = BOOL_TRUE;
+		break;
+	case SIGINT:
+		sigint_received = BOOL_TRUE;
+		break;
+	case SIGQUIT:
+		/* immediately disable further dialogs
+		 */
+		dlog_desist( );
+		sigquit_received = BOOL_TRUE;
+		break;
+	case SIGALRM:
+		break;
+	default:
+		sigstray_received = signo;
+		break;
 	}
-
-	/* if neither parent nor managed child nor slave, exit
-	 */
-	if ( pid != parentpid && stix == -1 ) {
-		exit( 0 );
-	}
-
-	/* parent signal handling
-	 */
-	if ( pid == parentpid ) {
-		pid_t cid;
-		intgen_t stat;
-		switch ( signo ) {
-		case SIGCLD:
-			/* bury the child and notify the child manager
-			 * abstraction of its death, and record death stats
-			 */
-			cid = wait( &stat );
-			stix = stream_getix( cid );
-			cldmgr_died( cid );
-			if ( WIFSIGNALED( stat ) || WEXITSTATUS( stat ) > 0 ) {
-				if ( prbcld_cnt == 0 ) {
-					if ( WIFSIGNALED( stat )) {
-						prbcld_pid = cid;
-						prbcld_xc = 0;
-						prbcld_signo = WTERMSIG( stat );
-					} else if ( WEXITSTATUS( stat ) > 0 ) {
-						prbcld_pid = cid;
-						prbcld_xc = WEXITSTATUS( stat );
-						prbcld_signo = 0;
-					}
-				}
-				prbcld_cnt++;
-			}
-			( void )sigset( signo, sighandler );
-			return;
-		case SIGHUP:
-			/* immediately disable further dialogs
-			 */
-			dlog_desist( );
-			sighup_received = BOOL_TRUE;
-			return;
-		case SIGTERM:
-			/* immediately disable further dialogs
-			 */
-			dlog_desist( );
-			sigterm_received = BOOL_TRUE;
-			return;
-		case SIGINT:
-			sigint_received = BOOL_TRUE;
-			return;
-		case SIGQUIT:
-			/* immediately disable further dialogs
-			 */
-			dlog_desist( );
-			sigquit_received = BOOL_TRUE;
-			return;
-		case SIGPIPE:
-			/* immediately disable further dialogs,
-			 * and ignore subsequent signals
-			 */
-			dlog_desist( );
-			sigpipe_received = BOOL_TRUE;
-			( void )sigset( signo, SIG_IGN );
-			return;
-		case SIGALRM:
-			return;
-		default:
-			sigstray_received = signo;
-			return;
-		}
-	}
-
-	/* managed child handling
-	 */
-	if ( stream_getix( pid ) != -1 ) {
-		switch ( signo ) {
-		case SIGHUP:
-			/* can get SIGHUP during dialog: just dismiss
-			 */
-			return;
-		case SIGTERM:
-			/* can get SIGTERM during dialog: just dismiss
-			 */
-			return;
-		case SIGINT:
-			/* can get SIGINT during dialog: just dismiss
-			 */
-			return;
-		case SIGQUIT:
-			/* can get SIGQUIT during dialog: just dismiss
-			 */
-			return;
-		case SIGPIPE:
-			/* forward write pipe failures to parent,
-			 * and ignore subsequent failures
-			 */
-			dlog_desist( );
-			kill( parentpid, SIGPIPE );
-			( void )sigset( signo, SIG_IGN );
-			return;
-		case SIGALRM:
-			/* accept and do nothing about alarm signals
-			 */
-			return;
-		default:
-			/* should not be any other captured signals:
-			 * request a core dump
-			 */
-			mlog_exit( EXIT_FAULT, RV_NONE );
-			exit( EXIT_FAULT );
-			return;
-		}
-	}
-
-	/* if some other child, just exit
-	 */
-	exit( 0 );
 }
 
 static int
@@ -1671,16 +1547,6 @@ childmain( void *arg1 )
 	ix_t stix;
 	intgen_t exitcode;
 	drive_t *drivep;
-
-	/* ignore signals
-	 */
-	sigset( SIGHUP, SIG_IGN );
-	sigset( SIGTERM, SIG_IGN );
-	sigset( SIGINT, SIG_IGN );
-	sigset( SIGQUIT, SIG_IGN );
-	sigset( SIGPIPE, SIG_IGN );
-	sigset( SIGALRM, SIG_IGN );
-	sigset( SIGCLD, SIG_IGN );
 
 	/* Determine which stream I am.
 	 */
@@ -2446,38 +2312,6 @@ set_rlimits( size64_t *vmszp )
 	*vmszp = vmsz;
 #endif /* RESTORE */
 	return BOOL_TRUE;
-}
-
-struct exit_printmap {
-	intgen_t code;
-	char *string;
-};
-
-typedef struct exit_printmap exit_printmap_t;
-
-static exit_printmap_t exit_printmap[ ] = {
-	{EXIT_NORMAL,	"EXIT_NORMAL"},
-	{EXIT_ERROR,	"EXIT_ERROR"},
-	{EXIT_INTERRUPT,"EXIT_INTERRUPT"},
-	{EXIT_FAULT,	"EXIT_FAULT"}
-};
-
-static char *
-exit_codestring( intgen_t code )
-{
-	exit_printmap_t *p = exit_printmap;
-	exit_printmap_t *endp = exit_printmap
-				+
-				( sizeof( exit_printmap )
-				  /
-				  sizeof( exit_printmap[ 0 ] ));
-	for ( ; p < endp ; p++ ) {
-		if ( p->code == code ) {
-			return p->string;
-		}
-	}
-
-	return "???";
 }
 
 struct sig_printmap {

@@ -166,19 +166,18 @@ typedef struct tran tran_t;
 #define NODESZ	48
 
 struct node {
-	xfs_ino_t n_ino;		/* 8  8 ino */
-	nrh_t n_nrh;		/* 4 12 handle to name in name registry */
-	dah_t n_dah;		/* 4 16 handle to directory attributes */
-	nh_t n_hashh;		/* 4 20 hash array */
-	nh_t n_parh;		/* 4 24 parent */
-	nh_t n_sibh;		/* 4 28 sibling list */
-	nh_t n_sibprevh;	/* 4 32 prev sibling list - dbl link list */
-	nh_t n_cldh;		/* 4 36 children list */
-	nh_t n_lnkh;		/* 4 40 hard link list */
-	gen_t n_gen;		/* 2 42 generation count mod 0x10000 */
-	u_char_t n_flags;	/* 1 43 action and state flags */
-	u_char_t n_nodehkbyte;	/* 1 44 given to node abstraction */
-	int32_t pad;		/* 4 48 padding to 8 byte boundary */
+	xfs_ino_t n_ino;	/* 8  8 ino */
+	nrh_t n_nrh;		/* 8 16 handle to name in name registry */
+	dah_t n_dah;		/* 4 20 handle to directory attributes */
+	nh_t n_hashh;		/* 4 24 hash array */
+	nh_t n_parh;		/* 4 28 parent */
+	nh_t n_sibh;		/* 4 32 sibling list */
+	nh_t n_sibprevh;	/* 4 36 prev sibling list - dbl link list */
+	nh_t n_cldh;		/* 4 40 children list */
+	nh_t n_lnkh;		/* 4 44 hard link list */
+	gen_t n_gen;		/* 2 46 generation count mod 0x10000 */
+	u_char_t n_flags;	/* 1 47 action and state flags */
+	u_char_t n_nodehkbyte;	/* 1 48 given to node abstraction */
 };
 
 typedef struct node node_t;
@@ -237,6 +236,14 @@ struct link_iter_context {
 };
 typedef struct link_iter_context link_iter_context_t;
 
+/* used for caching parent pathname from previous Node2path result
+ */
+struct path_cache {
+	nh_t nh;
+	intgen_t len;
+	char buf[MAXPATHLEN];
+};
+typedef struct path_cache path_cache_t;
 
 /* declarations of externally defined global symbols *************************/
 
@@ -255,7 +262,8 @@ static nh_t Node_alloc( xfs_ino_t ino,
 static void Node_free( nh_t *nhp );
 static node_t * Node_map( nh_t nh );
 static void Node_unmap( nh_t nh, node_t **npp );
-static intgen_t Node2path_recurse( nh_t nh, char *buf, intgen_t bufsz );
+static intgen_t Node2path_recurse( nh_t nh, char *buf,
+				   intgen_t bufsz, intgen_t level );
 static void adopt( nh_t parh, nh_t cldh, nrh_t nrh );
 static nrh_t disown( nh_t cldh );
 static void selsubtree( nh_t nh, bool_t sensepr );
@@ -503,11 +511,9 @@ tree_sync( char *hkdir,
 	bool_t ok;
 	intgen_t rval;
 
-#ifdef SESSCPLT
 	if ( persp ) {
 		return BOOL_TRUE;
 	}
-#endif /* SESSCPLT */
 
 	/* sanity checks
 	 */
@@ -3020,8 +3026,6 @@ tsi_cmd_quit( void *ctxp,
 {
 }
 
-#ifdef WHITEPARSE
-
 static int parse( int slotcnt, char **slotbuf, char *string );
 
 static void
@@ -3038,31 +3042,6 @@ tsi_cmd_parse( char *buf )
 
 	tranp->t_inter.i_argc = ( size_t )min( max( 0, wordcnt ), INTER_ARGMAX );
 }
-
-#else /* WHITEPARSE */
-
-static void
-tsi_cmd_parse( char *buf )
-{
-	size_t argc;
-	char *t;
-	char *b;
-
-	if ( ! buf ) {
-		tranp->t_inter.i_argc = 0;
-		return;
-	}
-
-	argc = 0;
-	b = buf;
-	while ( argc < INTER_ARGMAX && ( t = strtok( b, " \t" )) != 0 ) {
-		tranp->t_inter.i_argv[ argc++ ] = t;
-		b = 0;
-	}
-	tranp->t_inter.i_argc = argc;
-}
-
-#endif /* WHITEPARSE */
 
 struct tsi_cmd_tbl {
 	char *tct_pattern;
@@ -3393,9 +3372,9 @@ Node_free( nh_t *nhp )
 		namreg_del( np->n_nrh );
 		np->n_nrh = NRH_NULL;
 	}
-	if ( np->n_dah != NRH_NULL ) {
+	if ( np->n_dah != DAH_NULL ) {
 		dirattr_del( np->n_dah );
-		np->n_dah = NRH_NULL;
+		np->n_dah = DAH_NULL;
 	}
 	np->n_flags = 0;
 	np->n_parh = NH_NULL;
@@ -3436,7 +3415,7 @@ Node2path( nh_t nh, char *path, char *errmsg )
 {
 	intgen_t remainingcnt;
 	path[ 0 ] = 0; /* in case root node passed in */
-	remainingcnt = Node2path_recurse( nh, path, MAXPATHLEN );
+	remainingcnt = Node2path_recurse( nh, path, MAXPATHLEN, 0 );
 	if ( remainingcnt <= 0 ) {
 		node_t *np = Node_map( nh );
 		xfs_ino_t ino = np->n_ino;
@@ -3460,13 +3439,15 @@ Node2path( nh_t nh, char *path, char *errmsg )
  * works because the buffer size is secretly 2 * MAXPATHLEN.
  */
 static intgen_t
-Node2path_recurse( nh_t nh, char *buf, intgen_t bufsz )
+Node2path_recurse( nh_t nh, char *buf, intgen_t bufsz, intgen_t level )
 {
+	static path_cache_t cache = { NH_NULL, 0, "" };
 	node_t *np;
 	nh_t parh;
 	xfs_ino_t ino;
 	gen_t gen;
 	nrh_t nrh;
+	char *oldbuf;
 	intgen_t oldbufsz;
 	intgen_t namelen;
 
@@ -3474,6 +3455,14 @@ Node2path_recurse( nh_t nh, char *buf, intgen_t bufsz )
 	 */
 	if ( nh == persp->p_rooth ) {
 		return bufsz;
+	}
+
+	/* if we have a cache hit, no need to recurse any further
+	 */
+	if ( nh == cache.nh ) {
+		ASSERT( bufsz > cache.len );
+		strcpy( buf, cache.buf );
+		return bufsz - cache.len;
 	}
 
 	/* extract useful node members
@@ -3487,8 +3476,9 @@ Node2path_recurse( nh_t nh, char *buf, intgen_t bufsz )
 
 	/* build path to parent
 	 */
+	oldbuf = buf;
 	oldbufsz = bufsz;
-	bufsz = Node2path_recurse( parh, buf, bufsz ); /* RECURSION */
+	bufsz = Node2path_recurse( parh, buf, bufsz, level+1 ); /* RECURSION */
 	if ( bufsz <= 0 ) {
 		return bufsz;
 	}
@@ -3518,10 +3508,22 @@ Node2path_recurse( nh_t nh, char *buf, intgen_t bufsz )
 		ASSERT( namelen > 0 );
 	}
 
-	/* return remaining buffer size
+	/* update remaining buffer size
 	 */
 	bufsz -= namelen;
 	ASSERT( bufsz + MAXPATHLEN > 0 );
+
+	/* update the cache if we're the target's parent
+	 * (and the pathname is not too long)
+	 */
+	if ( level == 1 && bufsz > 0 ) {
+		cache.nh = nh;
+		strcpy( cache.buf, oldbuf );
+		cache.len = oldbufsz - bufsz;
+	}
+
+	/* return remaining buffer size
+	 */
 	return bufsz;
 }
 
@@ -4548,8 +4550,6 @@ tree_chk2_recurse( nh_t cldh, nh_t parh )
 
 #endif /* TREE_CHK */
 
-#ifdef WHITEPARSE
-
 static char *whites = " \t\r\n\v\f";
 
 static int is_white( char c );
@@ -4862,8 +4862,6 @@ octal_to_size( char c )
 
 	return 0;
 }
-
-#endif /* WHITEPARSE */
 
 static int
 mkdir_r(char *path)

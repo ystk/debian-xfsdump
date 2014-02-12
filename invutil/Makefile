@@ -49,9 +49,7 @@ LINKS  = $(COMMINCL) $(COMMON) $(INVINCL) $(INVCOMMON)
 LDIRT = $(LINKS)
 LLDLIBS = $(LIBUUID) $(LIBCURSES)
 
-#LCFLAGS = -DDUMP -DRMT -DEXTATTR -DBASED -DDOSOCKS -DINVCONVFIX -DSIZEEST -DPIPEINVFIX
-LCFLAGS = -DDUMP -DBASED -DDOSOCKS -DINVCONVFIX -DSIZEEST -DPIPEINVFIX
-#LCFLAGS = -DINV_DEBUG -DDUMP -DBASED -DDOSOCKS -DINVCONVFIX -DSIZEEST -DPIPEINVFIX
+LCFLAGS = -DDUMP
 
 ifeq ($(ENABLE_CURSES), yes)
 CFILES += $(CURSESCOMMON)
@@ -61,7 +59,7 @@ else
 LSRCFILES += $(CURSESCOMMON) $(CURSESINCL)
 endif
 
-default: $(LTCOMMAND)
+default: depend $(LTCOMMAND)
 
 include $(BUILDRULES)
 
@@ -70,8 +68,14 @@ install: default
 	$(LTINSTALL) -m 755 $(LTCOMMAND) $(PKG_SBIN_DIR)
 install-dev:
 
+.dep: $(COMMINCL) $(COMMON) $(INVINCL) $(INVCOMMON)
+
 $(COMMINCL) $(COMMON):
-	$(RM) $@; $(LN_S) ../common/$@ $@
+	@echo "    [LN]     $@"
+	$(Q)$(RM) $@; $(LN_S) ../common/$@ $@
 
 $(INVINCL) $(INVCOMMON):
-	$(RM) $@; $(LN_S) ../inventory/$@ $@
+	@echo "    [LN]     $@"
+	$(Q)$(RM) $@; $(LN_S) ../inventory/$@ $@
+
+-include .dep

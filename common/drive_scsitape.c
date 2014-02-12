@@ -24,11 +24,9 @@
 #include <sys/sem.h>
 #include <sys/prctl.h>
 #include <time.h>
-#include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/sysmacros.h>
-#include <sys/signal.h>
 #include <malloc.h>
 #include <sched.h>
 
@@ -55,13 +53,6 @@
 
 /* remote tape protocol debug
  */
-#ifdef OPENMASKED
-static intgen_t open_masked_signals( char *path, int oflags );
-#else /* OPENMASKED */
-#define open_masked_signals(p,f)	open(p,f)
-#endif /* OPENMASKED */
-
-#ifdef RMT
 #ifdef RMTDBG
 #define	open(p,f)		dbgrmtopen(p,f)
 #define	close(fd)		dbgrmtclose(fd)
@@ -75,7 +66,6 @@ static intgen_t open_masked_signals( char *path, int oflags );
 #define	read rmtread
 #define	write rmtwrite
 #endif /* RMTDBG */
-#endif /* RMT */
 
 /* if the media file header structure changes, this number must be
  * bumped, and STAPE_VERSION_1 must be defined and recognized.
@@ -292,21 +282,17 @@ typedef long mtstat_t;
 
 extern void usage( void );
 #ifdef DUMP
-#ifdef SIZEEST
 extern u_int64_t hdr_mfilesz;
-#endif /* SIZEEST */
 #endif /* DUMP */
 
 /* remote tape protocol declarations (should be a system header file)
  */
-#ifdef RMT
 extern int rmtopen( char *, int, ... );
 extern int rmtclose( int );
 extern int rmtfstat( int, struct stat * );
 extern int rmtioctl( int, int, ... );
 extern int rmtread( int, void*, uint);
 extern int rmtwrite( int, const void *, uint);
-#endif /* RMT */
 
 
 /* forward declarations of locally defined static functions ******************/
@@ -374,9 +360,6 @@ static intgen_t quick_backup( drive_t *drivep,
 static intgen_t record_hdr_validate( drive_t *drivep,
 				     char *bufp,
 				     bool_t chkoffpr );
-static void ring_thread( void *clientctxp,
-			 int ( * entryp )( void *ringctxp ),
-			 void *ringctxp );
 static int ring_read( void *clientctxp, char *bufp );
 static int ring_write( void *clientctxp, char *bufp );
 static double percent64( off64_t num, off64_t denom );
@@ -401,7 +384,6 @@ static void map_ts_status( struct mtget *, struct mtget_sgi );
 
 /* RMT trace stubs
  */
-#ifdef RMT
 #ifdef RMTDBG
 static int dbgrmtopen( char *, int );
 static int dbgrmtclose( int );
@@ -409,7 +391,6 @@ static int dbgrmtioctl( int, int, void *);
 static int dbgrmtread( int, void*, uint);
 static int dbgrmtwrite( int, void *, uint);
 #endif /* RMTDBG */
-#endif /* RMT */
 
 /* definition of locally defined global variables ****************************/
 
@@ -539,7 +520,7 @@ ds_match( int argc, char *argv[], drive_t *drivep, bool_t singlethreaded )
 
 	if ( strchr( drivep->d_pathname, ':')) {
 		errno = 0;
-		fd = open_masked_signals( drivep->d_pathname, O_RDONLY );
+		fd = open( drivep->d_pathname, O_RDONLY );
 		if ( fd < 0 ) {
 			return -10;
 		}
@@ -700,7 +681,7 @@ ds_instantiate( int argc, char *argv[], drive_t *drivep, bool_t singlethreaded )
 		contextp->dc_ringp = ring_create( contextp->dc_ringlen,
 						  STAPE_MAX_RECSZ,
 						  contextp->dc_ringpinnedpr,
-						  ring_thread,
+						  drivep->d_index,
 						  ring_read,
 						  ring_write,
 						  ( void * )drivep,
@@ -3303,7 +3284,6 @@ set_recommended_sizes( drive_t *drivep )
 	if (contextp->dc_filesz > 0) {
 		fsize = contextp->dc_filesz;
 #ifdef DUMP
-#ifdef SIZEEST
 		if ( hdr_mfilesz > fsize ) {
 			mlog( MLOG_WARNING, _(
 			      "recommended media file size of %llu Mb less than"
@@ -3312,7 +3292,6 @@ set_recommended_sizes( drive_t *drivep )
 			      hdr_mfilesz / ( 1024 * 1024 ),
 			      drivep->d_pathname );
 		}
-#endif /* SIZEEST */
 #endif /* DUMP */
         }
 
@@ -3668,7 +3647,6 @@ tape_rec_checksum_check( drive_context_t *contextp, char *bufp )
 
 /* to trace rmt operations
  */
-#ifdef RMT
 #ifdef RMTDBG
 static int
 dbgrmtopen( char *path, int flags )
@@ -3743,7 +3721,6 @@ dbgrmtwrite( int fd, void *p, uint sz )
 	return rval;
 }
 #endif /* RMTDBG */
-#endif /* RMT */
 
 /* display_access_failed_message()
  *	Print tape device open/access failed message.
@@ -4682,7 +4659,7 @@ Open( drive_t *drivep )
 	ASSERT( contextp->dc_fd == -1 );
 
 	errno = 0;
-	contextp->dc_fd = open_masked_signals( drivep->d_pathname, oflags );
+	contextp->dc_fd = open( drivep->d_pathname, oflags );
 
 	if ( contextp->dc_fd <= 0 ) {
 		return BOOL_FALSE;
@@ -5088,24 +5065,6 @@ ring_write( void *clientctxp, char *bufp )
 	return write_record( ( drive_t * )clientctxp, bufp, BOOL_TRUE, BOOL_TRUE );
 }
 
-static void
-ring_thread( void *clientctxp,
-	     int ( * entryp )( void *ringctxp ),
-	     void *ringctxp )
-{
-	drive_t *drivep = ( drive_t * )clientctxp;
-	/* REFERENCED */
-	bool_t ok;
-
-	ok = cldmgr_create( entryp,
-			    CLONE_VM,
-			    drivep->d_index,
-			    "slave",
-			    ringctxp );
-	ASSERT( ok );
-}
-
-
 static ring_msg_t *
 Ring_get( ring_t *ringp )
 {
@@ -5425,52 +5384,6 @@ isefsdump( drive_t *drivep )
 		return BOOL_FALSE;
 	}
 }
-
-#ifdef OPENMASKED
-
-static intgen_t
-open_masked_signals( char *pathname, int oflags )
-{
-	bool_t isrmtpr;
-	SIG_PF sigalrm_save;
-	SIG_PF sigint_save;
-	SIG_PF sighup_save;
-	SIG_PF sigquit_save;
-	SIG_PF sigcld_save;
-	intgen_t rval;
-	intgen_t saved_errno;
-
-	if ( strchr( pathname, ':') ) {
-		isrmtpr = BOOL_TRUE;
-	} else {
-		isrmtpr = BOOL_FALSE;
-	}
-
-	if ( isrmtpr ) {
-		sigalrm_save = sigset( SIGALRM, SIG_IGN );
-		sigint_save = sigset( SIGINT, SIG_IGN );
-		sighup_save = sigset( SIGHUP, SIG_IGN );
-		sigquit_save = sigset( SIGQUIT, SIG_IGN );
-		sigcld_save = sigset( SIGCLD, SIG_IGN );
-	}
-
-	errno = 0;
-	rval = open( pathname, oflags );
-	saved_errno = errno;
-
-	if ( isrmtpr ) {
-		( void )sigset( SIGCLD, sigcld_save );
-		( void )sigset( SIGQUIT, sigquit_save );
-		( void )sigset( SIGHUP, sighup_save );
-		( void )sigset( SIGINT, sigint_save );
-		( void )sigset( SIGALRM, sigalrm_save );
-	}
-
-	errno = saved_errno;
-	return rval;
-}
-
-#endif /* OPENMASKED */
 
 /*
  * General purpose routine which dredges through procfs trying to

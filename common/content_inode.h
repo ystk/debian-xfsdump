@@ -339,12 +339,43 @@ typedef struct extattrhdr extattrhdr_t;
 #define EXTATTRHDR_FLAGS_NULL		( 1 << 1 )
 	/* marks the end of the attributes associated with the leading filehdr_t
 	 */
-#define EXTATTRHDR_FLAGS_CHECKSUM	( 1 << 2 )
-	/* checksum is present
+#define EXTATTRHDR_FLAGS_OLD_CHECKSUM	( 1 << 2 )
+	/* old xfsdumps used this flag to indicate a checksum is present,
+	 * but the checksum was not calculated properly. the presence of
+	 * this flag now indicates a checksum that cannot be verified.
 	 */
-
 #define EXTATTRHDR_FLAGS_SECURE		( 1 << 3 )
 	/* a linux "secure" mode attribute
 	 */
+#define EXTATTRHDR_FLAGS_CHECKSUM	( 1 << 4 )
+	/* checksum is present.
+	 */
+
+/* Routines for calculating and validating checksums on xfsdump headers.
+ * The header length must be an integral number of u_int32_t's.
+ */
+static inline u_int32_t
+calc_checksum(void *bufp, size_t len)
+{
+	u_int32_t sum = 0;
+	u_int32_t *sump = bufp;
+	u_int32_t *endp = sump + len / sizeof(u_int32_t);
+	ASSERT(len % sizeof(u_int32_t) == 0);
+	while (sump < endp)
+		sum += *sump++;
+	return ~sum + 1;
+}
+
+static inline bool_t
+is_checksum_valid(void *bufp, size_t len)
+{
+	u_int32_t sum = 0;
+	u_int32_t *sump = bufp;
+	u_int32_t *endp = sump + len / sizeof(u_int32_t);
+	ASSERT(len % sizeof(u_int32_t) == 0);
+	while (sump < endp)
+		sum += *sump++;
+	return sum == 0 ? BOOL_TRUE : BOOL_FALSE;
+}
 
 #endif /* CONTENT_INODE_H */

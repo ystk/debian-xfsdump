@@ -386,9 +386,7 @@ static int getxfsqstat( char *fsdev );
 bool_t content_media_change_needed;
 char *media_change_alert_program = NULL;
 hsm_fs_ctxt_t *hsm_fs_ctxtp = NULL;
-#ifdef SIZEEST
 u_int64_t hdr_mfilesz = 0;
-#endif /* SIZEEST */
 u_int64_t maxdumpfilesize = 0;
 bool_t allowexcludefiles_pr = BOOL_FALSE;
 
@@ -498,16 +496,22 @@ static bool_t sc_savequotas = BOOL_TRUE;
 /* save quota information in dump
  */
 static quota_info_t quotas[] = {
-	{ "user quota",		BOOL_TRUE,	CONTENT_QUOTAFILE,	"", "-uf", XFS_QUOTA_UDQ_ACCT },
-	{ "project quota",	BOOL_TRUE,	CONTENT_PQUOTAFILE,	"", "-pf", XFS_QUOTA_PDQ_ACCT },
-	{ "group quota",	BOOL_TRUE,	CONTENT_GQUOTAFILE,	"", "-gf", XFS_QUOTA_GDQ_ACCT }
+	{ "user quota",		BOOL_TRUE,	CONTENT_QUOTAFILE,	"", "-uf", XFS_QUOTA_UDQ_ACCT, 0 },
+	{ "project quota",	BOOL_TRUE,	CONTENT_PQUOTAFILE,	"", "-pf", XFS_QUOTA_PDQ_ACCT, 0 },
+	{ "group quota",	BOOL_TRUE,	CONTENT_GQUOTAFILE,	"", "-gf", XFS_QUOTA_GDQ_ACCT, 0 }
 };
 
 /* definition of locally defined global functions ****************************/
 
 
 /* definition of locally defined static functions ****************************/
-
+static bool_t create_inv_session(
+		global_hdr_t *gwhdrtemplatep,
+		uuid_t *fsidp,
+		const char *mntpnt,
+		const char *fsdevice,
+		ix_t subtreecnt,
+		size_t strmix);
 
 bool_t
 content_init( intgen_t argc,
@@ -549,12 +553,9 @@ content_init( intgen_t argc,
 	bool_t ok;
 	extern char *optarg;
 	extern int optind, opterr, optopt;
-#ifdef BASED
 	char *baseuuidstr = NULL;
 	uuid_t baseuuid;
 	bool_t baseuuidvalpr;
-#endif /* BASED */
-#ifdef SIZEEST
 	u_int64_t dircnt;
 	u_int64_t nondircnt;
 	u_int64_t datasz;
@@ -563,7 +564,6 @@ content_init( intgen_t argc,
 	u_int64_t direntsz;
 	u_int64_t filesz;
 	u_int64_t size_estimate;
-#endif /* SIZEEST */
 
 	/* basic sanity checks
 	 */
@@ -591,9 +591,7 @@ content_init( intgen_t argc,
 	optind = 1;
 	opterr = 0;
 	subtreecnt = 0;
-#ifdef BASED
 	baseuuidvalpr = BOOL_FALSE;
-#endif /* BASED */
 	while ( ( c = getopt( argc, argv, GETOPT_CMDSTRING )) != EOF ) {
 		switch ( c ) {
 		case GETOPT_LEVEL:
@@ -681,7 +679,6 @@ content_init( intgen_t argc,
 		case GETOPT_DUMPASOFFLINE:
 			sc_dumpasoffline = BOOL_TRUE;
 			break;
-#ifdef BASED
 		case GETOPT_BASED:
 			if ( ! optarg || optarg[ 0 ] == '-' ) {
 				mlog( MLOG_NORMAL | MLOG_ERROR, _(
@@ -701,11 +698,9 @@ content_init( intgen_t argc,
 				return BOOL_FALSE;
 			}
 			baseuuidvalpr = BOOL_TRUE;
-#endif /* BASED */
 		}
 	}
 
-#ifdef BASED
 	if ( resumereqpr && baseuuidvalpr ) {
 		mlog( MLOG_NORMAL | MLOG_ERROR, _(
 		      "may not specify both -%c and -%c\n"),
@@ -713,7 +708,6 @@ content_init( intgen_t argc,
 		      GETOPT_RESUME );
 		return BOOL_FALSE;
 	}
-#endif /* BASED */
 
 	/* the user may specify stdout as the destination, by a single
 	 * dash ('-') with no option letter. This must appear between
@@ -809,20 +803,6 @@ content_init( intgen_t argc,
 			     sizeof( cwhdrtemplatep->ch_fstype ));
 	uuid_copy( cwhdrtemplatep->ch_fsid, fsid );
 
-
-#ifndef PIPEINVFIX
-
-	/* use of any pipes precludes inventory update
-	 */
-	for ( strmix = 0 ; strmix < drivecnt ; strmix++ ) {
-		if ( drivepp[ strmix ]->d_isnamedpipepr
-		     ||
-		     drivepp[ strmix ]->d_isunnamedpipepr ) {
-			sc_inv_updatepr = BOOL_FALSE;
-		}
-	}
-#endif /* ! PIPEINVFIX */
-
 	/* write quota information */
 	if( sc_savequotas ) {
 
@@ -875,7 +855,6 @@ content_init( intgen_t argc,
 			     INV_SEARCH_ONLY,
 			     ( void * )&fsid );
 
-#ifdef BASED
 	/* if a based request, look for the indicated session.
 	 * if found, and not interrupted, this will be used as an
 	 * incremental base. if interrupted, will be used as
@@ -991,7 +970,6 @@ content_init( intgen_t argc,
 		inv_idbt = INV_TOKEN_NULL;
 		goto baseuuidbypass;
 	}
-#endif /* BASED */
 
 	/* look for the most recent dump at a level less than the level
 	 * of this dump. extract the time, level, id, and predicates partial
@@ -1116,9 +1094,7 @@ content_init( intgen_t argc,
 		samefoundpr = BOOL_TRUE;
 	}
 
-#ifdef BASED
 baseuuidbypass:
-#endif /* BASED */
 
 	/* now determine the incremental and resume bases, if any.
 	 */
@@ -1485,8 +1461,7 @@ baseuuidbypass:
 	var_skip( &fsid, inomap_skip );
 
 	/* fill in write header template content info. always produce
-	 * an inomap and dir dump for each media file. flag the checksums
-	 * available if so compiled (see -D...CHECKSUM in Makefile).
+	 * an inomap and dir dump for each media file.
 	 */
 	ASSERT( sizeof( cwhdrtemplatep->ch_specific ) >= sizeof( *scwhdrtemplatep ));
 	scwhdrtemplatep->cih_mediafiletype = CIH_MEDIAFILETYPE_DATA;
@@ -1500,15 +1475,9 @@ baseuuidbypass:
 	if ( sc_inv_updatepr ) {
 		scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_INVENTORY;
 	}
-#ifdef FILEHDR_CHECKSUM
 	scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_FILEHDR_CHECKSUM;
-#endif /* FILEHDR_CHECKSUM */
-#ifdef EXTENTHDR_CHECKSUM
 	scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_EXTENTHDR_CHECKSUM;
-#endif /* EXTENTHDR_CHECKSUM */
-#ifdef DIRENTHDR_CHECKSUM
 	scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_DIRENTHDR_CHECKSUM;
-#endif /* DIRENTHDR_CHECKSUM */
 	scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_DIRENTHDR_GEN;
 	if ( sc_incrpr ) {
 		scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_INCREMENTAL;
@@ -1522,16 +1491,13 @@ baseuuidbypass:
 	}
 	if ( sc_dumpextattrpr ) {
 		scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_EXTATTR;
-#ifdef EXTATTRHDR_CHECKSUM
 		scwhdrtemplatep->cih_dumpattr |=
 					CIH_DUMPATTR_EXTATTRHDR_CHECKSUM;
-#endif /* EXTATTRHDR_CHECKSUM */
 	}
 
 	scwhdrtemplatep->cih_rootino = sc_rootxfsstatp->bs_ino;
 	inomap_writehdr( scwhdrtemplatep );
 
-#ifdef SIZEEST
 	/* log the dump size. just a rough approx.
 	 */
 	dircnt = scwhdrtemplatep->cih_inomap_dircnt;
@@ -1570,7 +1536,6 @@ baseuuidbypass:
 	      "file hdrs: %llu bytes, datasz: %llu bytes\n",
 	      GLOBAL_HDR_SZ, inomapsz, direntsz,
 	      filesz, datasz );
-#endif /* SIZEEST */
 
 	/* extract the progress stat denominators from the write hdr
 	 * template. placed there by inomap_writehdr( )
@@ -1695,103 +1660,27 @@ baseuuidbypass:
 	}
 
 	/* open the dump inventory and a dump inventory write session
-	 * if an inventory update is to be done. first create a cleanup
-	 * handler, to close the inventory on exit.
+	 * if an inventory update is to be done.
 	 */
 	if ( sc_inv_updatepr ) {
-		char *qmntpnt;
-		char *qfsdevice;
+		bool_t result;
+		sigset_t tty_set, orig_set;
 
-		rval = atexit( inv_cleanup );
-		ASSERT( ! rval );
-		sc_inv_idbtoken = inv_open( ( inv_predicate_t )INV_BY_UUID,
-					    INV_SEARCH_N_MOD,
-					    ( void * )&fsid );
-		if ( sc_inv_idbtoken == INV_TOKEN_NULL ) {
+		/* hold tty signals while creating a new inventory session */
+		sigemptyset( &tty_set );
+		sigaddset( &tty_set, SIGINT );
+		sigaddset( &tty_set, SIGQUIT );
+		sigaddset( &tty_set, SIGHUP );
+		sigprocmask( SIG_BLOCK, &tty_set, &orig_set );
+
+		result = create_inv_session( gwhdrtemplatep, &fsid, mntpnt,
+					     fsdevice, subtreecnt, strmix );
+
+		sigprocmask( SIG_SETMASK, &orig_set, NULL );
+
+		if ( !result ) {
 			return BOOL_FALSE;
 		}
-		qmntpnt = ( char * )calloc( 1, strlen( gwhdrtemplatep->gh_hostname )
-					       +
-					       1
-					       +
-					       strlen( mntpnt )
-					       +
-					       1 );
-		ASSERT( qmntpnt );
-		ASSERT( strlen( gwhdrtemplatep->gh_hostname ));
-		( void )sprintf( qmntpnt,
-				 "%s:%s",
-				 gwhdrtemplatep->gh_hostname,
-				 mntpnt );
-		qfsdevice = ( char * )calloc( 1, strlen( gwhdrtemplatep->gh_hostname )
-					       +
-					       1
-					       +
-					       strlen( fsdevice )
-					       +
-					       1 );
-		ASSERT( qfsdevice );
-		( void )sprintf( qfsdevice,
-				 "%s:%s",
-				 gwhdrtemplatep->gh_hostname,
-				 fsdevice );
-
-		/* hold tty signals while creating a new inventory session
-		 */
-		( void )sighold( SIGINT );
-		( void )sighold( SIGQUIT );
-		( void )sighold( SIGHUP );
-
-		sc_inv_sestoken = inv_writesession_open( sc_inv_idbtoken,
-						&fsid,
-						&gwhdrtemplatep->gh_dumpid,
-						gwhdrtemplatep->gh_dumplabel,
-						subtreecnt ? BOOL_TRUE
-							   : BOOL_FALSE,
-						sc_resumepr,
-						( u_char_t )sc_level,
-						drivecnt,
-						gwhdrtemplatep->gh_timestamp,
-						qmntpnt,
-						qfsdevice );
-		if( sc_inv_sestoken == INV_TOKEN_NULL ) {
-			( void )sigrelse( SIGINT );
-			( void )sigrelse( SIGQUIT );
-			( void )sigrelse( SIGHUP );
-			return BOOL_FALSE;
-		}
-
-		/* open an inventory stream for each stream
-		 */
-		sc_inv_stmtokenp = ( inv_stmtoken_t * )calloc( drivecnt,
-							       sizeof( inv_stmtoken_t ));
-		ASSERT( sc_inv_stmtokenp );
-		for ( strmix = 0 ; strmix < drivecnt ; strmix++ ) {
-			drive_t *drivep = drivepp[ strmix ];
-			char *drvpath;
-
-			if ( strcmp( drivep->d_pathname, "stdio" )) {
-				drvpath = path_reltoabs( drivep->d_pathname,
-							 homedir );
-			} else {
-				drvpath = drivep->d_pathname;
-			}
-			sc_inv_stmtokenp[ strmix ] = inv_stream_open( sc_inv_sestoken,
-								      drvpath );
-			if ( strcmp( drivep->d_pathname, "stdio" )) {
-				free( ( void * )drvpath );
-			}
-			if ( sc_inv_stmtokenp[ strmix ] == INV_TOKEN_NULL ) {
-				( void )sigrelse( SIGINT );
-				( void )sigrelse( SIGQUIT );
-				( void )sigrelse( SIGHUP );
-				return BOOL_FALSE;
-			}
-		}
-
-		( void )sigrelse( SIGINT );
-		( void )sigrelse( SIGQUIT );
-		( void )sigrelse( SIGHUP );
 	}
 
 	/* set media change flags to FALSE;
@@ -2013,6 +1902,82 @@ content_statline( char **linespp[ ] )
 	}
 
 	return statlinecnt;
+}
+
+static bool_t
+create_inv_session(
+		global_hdr_t *gwhdrtemplatep,
+		uuid_t *fsidp,
+		const char *mntpnt,
+		const char *fsdevice,
+		ix_t subtreecnt,
+		size_t strmix)
+{
+	intgen_t rval;
+	char *qmntpnt;
+	char *qfsdevice;
+
+	/* create a cleanup handler to close the inventory on exit. */
+	rval = atexit( inv_cleanup );
+	ASSERT( ! rval );
+
+	sc_inv_idbtoken = inv_open( ( inv_predicate_t )INV_BY_UUID,
+					INV_SEARCH_N_MOD,
+					( void * )fsidp );
+	if ( sc_inv_idbtoken == INV_TOKEN_NULL ) {
+		return BOOL_FALSE;
+	}
+	qmntpnt = ( char * )calloc( 1, strlen( gwhdrtemplatep->gh_hostname )
+					+ 1 + strlen( mntpnt ) + 1 );
+	ASSERT( qmntpnt );
+	ASSERT( strlen( gwhdrtemplatep->gh_hostname ));
+	sprintf( qmntpnt, "%s:%s", gwhdrtemplatep->gh_hostname, mntpnt );
+	qfsdevice = ( char * )calloc( 1, strlen( gwhdrtemplatep->gh_hostname )
+					 + 1 + strlen( fsdevice ) + 1 );
+	ASSERT( qfsdevice );
+	sprintf( qfsdevice, "%s:%s", gwhdrtemplatep->gh_hostname, fsdevice );
+
+	sc_inv_sestoken = inv_writesession_open( sc_inv_idbtoken,
+						fsidp,
+						&gwhdrtemplatep->gh_dumpid,
+						gwhdrtemplatep->gh_dumplabel,
+						subtreecnt ? BOOL_TRUE
+							   : BOOL_FALSE,
+						sc_resumepr,
+						( u_char_t )sc_level,
+						drivecnt,
+						gwhdrtemplatep->gh_timestamp,
+						qmntpnt,
+						qfsdevice );
+	if ( sc_inv_sestoken == INV_TOKEN_NULL ) {
+		return BOOL_FALSE;
+	}
+
+	/* open an inventory stream for each stream
+	*/
+	sc_inv_stmtokenp = ( inv_stmtoken_t * )
+				calloc( drivecnt, sizeof( inv_stmtoken_t ));
+	ASSERT( sc_inv_stmtokenp );
+	for ( strmix = 0 ; strmix < drivecnt ; strmix++ ) {
+		drive_t *drivep = drivepp[ strmix ];
+		char *drvpath;
+
+		if ( strcmp( drivep->d_pathname, "stdio" )) {
+			drvpath = path_reltoabs( drivep->d_pathname, homedir );
+		} else {
+			drvpath = drivep->d_pathname;
+		}
+		sc_inv_stmtokenp[ strmix ] = inv_stream_open( sc_inv_sestoken,
+								drvpath );
+		if ( strcmp( drivep->d_pathname, "stdio" )) {
+			free( ( void * )drvpath );
+		}
+		if ( sc_inv_stmtokenp[ strmix ] == INV_TOKEN_NULL ) {
+			return BOOL_FALSE;
+		}
+	}
+
+	return BOOL_TRUE;
 }
 
 static void
@@ -3737,6 +3702,8 @@ dump_extattr_buildrecord( xfs_bstat_t *statp,
 		     namesz, namesrcp,
 		     valuesz );
 	( void )strcpy( namep, namesrcp );
+
+	memset( ( void * )&tmpah, 0, sizeof( tmpah ));
 	tmpah.ah_sz = recsz;
 	ASSERT( EXTATTRHDR_SZ + namesz < UINT16MAX );
 	tmpah.ah_valoff = ( u_int16_t )( EXTATTRHDR_SZ + namesz );
@@ -3744,17 +3711,8 @@ dump_extattr_buildrecord( xfs_bstat_t *statp,
 		(( flag & ATTR_ROOT ) ? EXTATTRHDR_FLAGS_ROOT :
 		(( flag & ATTR_SECURE ) ? EXTATTRHDR_FLAGS_SECURE : 0));
 	tmpah.ah_valsz = valuesz;
-	tmpah.ah_checksum = 0;
-#ifdef EXTATTRHDR_CHECKSUM
-	{
-	register u_int32_t *sump = ( u_int32_t * )ahdrp;
-	register u_int32_t *endp = ( u_int32_t * )( ahdrp + 1 );
-	register u_int32_t sum;
 	tmpah.ah_flags |= EXTATTRHDR_FLAGS_CHECKSUM;
-	for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-	tmpah.ah_checksum = ~sum + 1;
-	}
-#endif /* EXTATTRHDR_CHECKSUM */
+	tmpah.ah_checksum = calc_checksum( &tmpah, EXTATTRHDR_SZ );
 
 	xlate_extattrhdr(ahdrp, &tmpah, -1);
 	*valuepp = valuep;
@@ -3776,23 +3734,13 @@ dump_extattrhdr( drive_t *drivep,
 	intgen_t rval;
 	rv_t rv;
 
+	memset( ( void * )&ahdr, 0, sizeof( ahdr ));
 	ahdr.ah_sz = recsz;
 	ASSERT( valoff < UINT16MAX );
 	ahdr.ah_valoff = ( u_int16_t )valoff;
-	ahdr.ah_flags = ( u_int16_t )flags;
+	ahdr.ah_flags = ( u_int16_t )flags | EXTATTRHDR_FLAGS_CHECKSUM;
 	ahdr.ah_valsz = valsz;
-	ahdr.ah_checksum = 0;
-
-#ifdef EXTATTRHDR_CHECKSUM
-	{
-	register u_int32_t *sump = ( u_int32_t * )&ahdr;
-	register u_int32_t *endp = ( u_int32_t * )( &ahdr + 1 );
-	register u_int32_t sum;
-	ahdr.ah_flags |= EXTATTRHDR_FLAGS_CHECKSUM;
-	for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-	ahdr.ah_checksum = ~sum + 1;
-	}
-#endif /* EXTATTRHDR_CHECKSUM */
+	ahdr.ah_checksum = calc_checksum( &ahdr, EXTATTRHDR_SZ );
 
 	xlate_extattrhdr(&ahdr, &tmpahdr, 1);
 	rval = write_buf( ( char * )&tmpahdr,
@@ -3976,7 +3924,9 @@ dump_file( void *arg1,
 						     1);
 			}
 
-			if (estimated_size > maxdumpfilesize) {
+			/* quota files are exempt from max size check */
+			if (estimated_size > maxdumpfilesize &&
+			    !is_quota_file(statp->bs_ino)) {
 				mlog( MLOG_DEBUG | MLOG_NOTE,
 				      "ino %llu increased beyond maximum size: "
 				      "NOT dumping\n",
@@ -4003,9 +3953,7 @@ dump_file( void *arg1,
 	case S_IFNAM:
 #endif
 	case S_IFLNK:
-#ifdef DOSOCKS
 	case S_IFSOCK:
-#endif /* DOSOCKS */
 		/* only need a filehdr_t; no data
 		 */
 		rv = dump_file_spec( drivep, contextp, fshandlep, statp );
@@ -4016,18 +3964,6 @@ dump_file( void *arg1,
 			contextp->cc_stat_lastino = statp->bs_ino;
 		}
 		break; /* drop out of switch to extattr dump */
-#ifndef DOSOCKS
-	case S_IFSOCK:
-		/* don't dump these
-		 */
-		if ( statp->bs_ino > contextp->cc_stat_lastino ) {
-			lock( );
-			sc_stat_nondirdone++;
-			unlock( );
-			contextp->cc_stat_lastino = statp->bs_ino;
-		}
-		return RV_OK;
-#endif /* ! DOSOCKS */
 	case S_IFDIR:
 	default:
 		/* don't know how to dump these
@@ -5094,11 +5030,6 @@ dump_filehdr( drive_t *drivep,
 	drive_ops_t *dop = drivep->d_opsp;
 	register filehdr_t *fhdrp = contextp->cc_filehdrp;
 	filehdr_t tmpfhdrp;
-#ifdef FILEHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )fhdrp;
-	register u_int32_t *endp = ( u_int32_t * )( fhdrp + 1 );
-	register u_int32_t sum;
-#endif /* FILEHDR_CHECKSUM */
 	intgen_t rval;
 	rv_t rv;
 
@@ -5110,13 +5041,8 @@ dump_filehdr( drive_t *drivep,
 		copy_xfs_bstat(&fhdrp->fh_stat, statp);
 	}
 	fhdrp->fh_offset = offset;
-	fhdrp->fh_flags = flags;
-
-#ifdef FILEHDR_CHECKSUM
-	fhdrp->fh_flags |= FILEHDR_FLAGS_CHECKSUM;
-	for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-	fhdrp->fh_checksum = ~sum + 1;
-#endif /* FILEHDR_CHECKSUM */
+	fhdrp->fh_flags = flags | FILEHDR_FLAGS_CHECKSUM;
+	fhdrp->fh_checksum = calc_checksum( fhdrp, FILEHDR_SZ );
 
 	xlate_filehdr(fhdrp, &tmpfhdrp, 1);
 	rval = write_buf( ( char * )&tmpfhdrp,
@@ -5156,11 +5082,6 @@ dump_extenthdr( drive_t *drivep,
 	drive_ops_t *dop = drivep->d_opsp;
 	register extenthdr_t *ehdrp = contextp->cc_extenthdrp;
 	extenthdr_t tmpehdrp;
-#ifdef EXTENTHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )ehdrp;
-	register u_int32_t *endp = ( u_int32_t * )( ehdrp + 1 );
-	register u_int32_t sum;
-#endif /* EXTENTHDR_CHECKSUM */
 	intgen_t rval;
 	rv_t rv;
 	char typestr[20];
@@ -5190,15 +5111,10 @@ dump_extenthdr( drive_t *drivep,
 
 	( void )memset( ( void * )ehdrp, 0, sizeof( *ehdrp ));
 	ehdrp->eh_type = type;
-	ehdrp->eh_flags = flags;
+	ehdrp->eh_flags = flags | EXTENTHDR_FLAGS_CHECKSUM;
 	ehdrp->eh_offset = offset;
 	ehdrp->eh_sz = sz;
-
-#ifdef EXTENTHDR_CHECKSUM
-	ehdrp->eh_flags |= EXTENTHDR_FLAGS_CHECKSUM;
-	for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-	ehdrp->eh_checksum = ~sum + 1;
-#endif /* EXTENTHDR_CHECKSUM */
+	ehdrp->eh_checksum = calc_checksum( ehdrp, EXTENTHDR_SZ );
 
 	xlate_extenthdr(ehdrp, &tmpehdrp, 1);
 	rval = write_buf( ( char * )&tmpehdrp,
@@ -5241,11 +5157,6 @@ dump_dirent( drive_t *drivep,
 	direnthdr_t *tmpdhdrp;
 	size_t direntbufsz = contextp->cc_mdirentbufsz;
 	size_t sz;
-#ifdef DIRENTHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )dhdrp;
-	register u_int32_t *endp = ( u_int32_t * )( dhdrp + 1 );
-	register u_int32_t sum;
-#endif /* DIRENTHDR_CHECKSUM */
 	intgen_t rval;
 	rv_t rv;
 
@@ -5282,10 +5193,7 @@ dump_dirent( drive_t *drivep,
 		strcpy( dhdrp->dh_name, name );
 	}
 
-#ifdef DIRENTHDR_CHECKSUM
-	for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-	dhdrp->dh_checksum = ~sum + 1;
-#endif /* DIRENTHDR_CHECKSUM */
+	dhdrp->dh_checksum = calc_checksum( dhdrp, DIRENTHDR_SZ );
 
 	tmpdhdrp = malloc(sz);
 	xlate_direnthdr(dhdrp, tmpdhdrp, 1);
@@ -6698,6 +6606,18 @@ check_complete_flags( void )
 	return completepr;
 }
 
+extern bool_t
+is_quota_file(ino_t ino)
+{
+	int i;
+
+	for(i = 0; i < (sizeof(quotas) / sizeof(quotas[0])); i++) {
+		if (quotas[i].savequotas && ino == quotas[i].quotaino)
+			return BOOL_TRUE;
+	}
+	return BOOL_FALSE;
+}
+
 #define REPQUOTA "xfs_quota"
 
 static bool_t
@@ -6707,6 +6627,7 @@ save_quotas( char *mntpnt, quota_info_t *quotainfo )
         char            buf[1024] = "";
         int             fd;
         char            tmp;
+        struct stat     statb;
 
         mlog( MLOG_VERBOSE, _(
 		"saving %s information for: %s\n"), quotainfo->desc, mntpnt );
@@ -6747,6 +6668,16 @@ save_quotas( char *mntpnt, quota_info_t *quotainfo )
                   strerror( errno ));
             return BOOL_FALSE;
         }
+        if(fstat(fd, &statb) < 0) {
+            mlog( MLOG_ERROR, _(
+                  "stat failed %s: %s\n"),
+                  quotainfo->quotapath,
+                  strerror( errno ));
+            close(fd);
+            return BOOL_FALSE;
+        }
+        quotainfo->quotaino = statb.st_ino;
+
         /* open and read dump file to ensure it is in the dump */
         read(fd, &tmp, 1);
         close(fd);

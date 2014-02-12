@@ -19,10 +19,8 @@
 #include <xfs/xfs.h>
 #include <xfs/jdm.h>
 
-#ifdef DOSOCKS
 #include <sys/socket.h>
 #include <sys/un.h>
-#endif /* DOSOCKS */
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -70,6 +68,13 @@
  */
 
 /* structure definitions used locally ****************************************/
+
+#define HOUSEKEEPING_MAGIC	0x686b6d61
+	/* "hkma" - see the housekeeping_magic field of pers_t below.
+	 */
+#define HOUSEKEEPING_VERSION	1
+	/* see the housekeeping_version field of pers_t below.
+	 */
 
 #define WRITE_TRIES_MAX	3
 	/* retry loop tuning for write(2) workaround
@@ -358,12 +363,43 @@ struct stream_context {
 
 typedef struct stream_context stream_context_t;
 
-/* persistent state file header - two parts: accumulation state
- * which spans several sessions, and session state. each has a valid
- * bit, and no fields are valid until the valid bit is set.
- * all elements defined such that a bzero results in a valid initial state.
+/* persistent state file header - on-disk format information plus
+ * accumulation state (which spans several sessions) and session state.
+ * the latter two have a valid bit, and their fields are not valid until
+ * the valid bit is set. all elements defined such that a bzero results
+ * in a valid initial state.
  */
 struct pers {
+	/* on-disk format information used to verify that xfsrestore
+	 * can make sense of the data in xfsrestorehousekeepingdir
+	 * when running in cumulative mode or when resuming a restore.
+	 *
+	 * for backwards/forwards compatibility, this struct must be
+	 * the first field! also any changes to the struct must address
+	 * compatibility with other xfsrestore versions.
+	 */
+	struct {
+		size32_t housekeeping_magic;
+			/* used to determine if this struct has been
+			 * initialized, and whether the machine's
+			 * endianness is the same as the previous
+			 * invocation. (data written to xfsrestore's
+			 * state directory is not converted to an
+			 * endian-neutral format since it only persists
+			 * for the life of one or more restore sessions.)
+			 */
+		size32_t housekeeping_version;
+			/* version of the data structures used in the
+			 * state files in housekeepingdir. this must be
+			 * bumped whenever the on-disk format changes.
+			 */
+		size64_t pagesize;
+			/* headers in the persistent state files
+			 * are aligned on page size boundaries, so
+			 * this cannot change betweeen invocations.
+			 */
+	} v;
+
 	/* command line arguments from first session, and session
 	 * history.
 	 */
@@ -836,9 +872,7 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 	bool_t ownerpr;	/* cmd line chown/chmod requested */
 	bool_t restoredmpr; /* cmd line restore dm api attrs specification */
 	bool_t restoreextattrpr; /* cmd line restore extended attr spec */
-#ifdef SESSCPLT
 	bool_t sesscpltpr; /* force completion of prev interrupted session */
-#endif /* SESSCPLT */
 	ix_t stcnt;	/* cmd line number of subtrees requested */
 	bool_t firststsensepr;
 	bool_t firststsenseprvalpr;
@@ -900,9 +934,7 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 	ownerpr = BOOL_FALSE;
 	restoredmpr = BOOL_FALSE;
 	restoreextattrpr = BOOL_TRUE;
-#ifdef SESSCPLT
 	sesscpltpr = BOOL_FALSE;
-#endif /* SESSCPLT */
 	stcnt = 0;
 	firststsensepr = firststsenseprvalpr = BOOL_FALSE;
 	stsz = 0;
@@ -1121,11 +1153,9 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 		case GETOPT_NOEXTATTR:
 			restoreextattrpr = BOOL_FALSE;
 			break;
-#ifdef SESSCPLT
 		case GETOPT_SESSCPLT:
 			sesscpltpr = BOOL_TRUE;
 			break;
-#endif /* SESSCPLT */
 		case GETOPT_SMALLWINDOW:
 			/* obsolete */
 			break;
@@ -1301,6 +1331,49 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 		      strerror( errno ));
 		return BOOL_FALSE;
 	}
+
+	/* but first setup or verify the on-disk format information
+	 */
+	if ( ! persp->a.valpr ) {
+		/* this is the first restore session
+		 */
+		persp->v.housekeeping_magic = HOUSEKEEPING_MAGIC;
+		persp->v.housekeeping_version = HOUSEKEEPING_VERSION;
+		persp->v.pagesize = pgsz;
+
+	} else {
+		/* cumulative or resuming a restore, verify the header
+		 */
+		if ( persp->v.housekeeping_magic != HOUSEKEEPING_MAGIC ) {
+			mlog( MLOG_NORMAL | MLOG_ERROR, _(
+			      "%s format corrupt or wrong endianness "
+			      "(0x%x, expected 0x%x)\n"),
+			      hkdirname,
+			      persp->v.housekeeping_magic,
+			      HOUSEKEEPING_MAGIC );
+			return BOOL_FALSE;
+		}
+		if ( persp->v.housekeeping_version != HOUSEKEEPING_VERSION ) {
+			mlog( MLOG_NORMAL | MLOG_ERROR, _(
+			      "%s format version differs from previous "
+			      "restore (%u, expected %u)\n"),
+			      hkdirname,
+			      persp->v.housekeeping_version,
+			      HOUSEKEEPING_VERSION );
+			return BOOL_FALSE;
+		}
+		if ( persp->v.pagesize != pgsz ) {
+			mlog( MLOG_NORMAL | MLOG_ERROR, _(
+			      "%s format differs from previous "
+			      "restore due to page size change "
+			      "(was %lu, now %lu)\n"),
+			      hkdirname,
+			      persp->v.pagesize,
+			      pgsz );
+			return BOOL_FALSE;
+		}
+	}
+
 	if ( ! persp->a.valpr ) {
 		if ( ! dstdir ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
@@ -1324,7 +1397,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			usage( );
 			return BOOL_FALSE;
 		}
-#ifdef SESSCPLT
 		if ( sesscpltpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
 			      "-%c option invalid: there is no "
@@ -1333,7 +1405,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			usage( );
 			return BOOL_FALSE;
 		}
-#endif /* SESSCPLT */
 	} else if ( ! persp->s.valpr ) {
 		if ( ! cumpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
@@ -1349,7 +1420,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			usage( );
 			return BOOL_FALSE;
 		}
-#ifdef SESSCPLT
 		if ( sesscpltpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
 			      "-%c option invalid: there is no "
@@ -1358,7 +1428,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			usage( );
 			return BOOL_FALSE;
 		}
-#endif /* SESSCPLT */
 		if ( existpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
 			      "-%c valid only when initiating "
@@ -1396,7 +1465,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			return BOOL_FALSE;
 		}
 	} else {
-#ifdef SESSCPLT
 		if ( ! resumepr && ! sesscpltpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
 			      "-%c option required to resume "
@@ -1408,15 +1476,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			      GETOPT_SESSCPLT );
 			return BOOL_FALSE;
 		}
-#else /* SESSCPLT */
-		if ( ! resumepr ) {
-			mlog( MLOG_NORMAL | MLOG_ERROR, _(
-			      "-%c option required to resume previously "
-			      "interrupted restore session\n"),
-			      GETOPT_RESUME );
-			return BOOL_FALSE;
-		}
-#endif /* SESSCPLT */
 		if ( tranp->t_reqdumplabvalpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
 			      "-%c valid only when initiating restore\n"),
@@ -1488,7 +1547,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 	 */
 	ownerpr = ( geteuid( ) == 0 ) ? BOOL_TRUE : ownerpr;
 
-#ifdef SESSCPLT
 	/* force completion of interrupted restore if asked to do so
 	 */
 	if ( sesscpltpr ) {
@@ -1556,7 +1614,6 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			return EXIT_FAULT;
 		}
 	}
-#endif /* SESSCPLT */
 
 	/* for the three cases, calculate old and new mapping params
 	 * and wipe partial state
@@ -1565,7 +1622,8 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 		stpgcnt = 0;
 		newstpgcnt = ( stsz + pgmask ) / pgsz;
 		descpgcnt = 0;
-		memset( ( void * )persp, 0, sizeof( pers_t ));
+		memset( ( void * )&persp->a, 0,
+			sizeof( pers_t ) - offsetofmember( pers_t, a ));
 	} else if ( ! persp->s.valpr ) {
 		stpgcnt = persp->a.stpgcnt;
 		newstpgcnt = stpgcnt;
@@ -1848,7 +1906,7 @@ content_stream_restore( ix_t thrdix )
 		      "chdir %s failed: %s\n"),
 		      persp->a.dstdir,
 		      strerror( errno ));
-		return EXIT_ERROR;
+		return mlog_exit(EXIT_ERROR, RV_ERROR);
 	}
 
 	/* set my file creation mask to zero, to avoid modifying the
@@ -1869,7 +1927,7 @@ content_stream_restore( ix_t thrdix )
 		      _("malloc of stream context failed (%d bytes): %s\n"),
 		      sizeof(stream_context_t),
 		      strerror( errno ));
-		return EXIT_ERROR;
+		return mlog_exit(EXIT_ERROR, RV_ERROR);
 	}
 	strctxp->sc_fd = -1;
 	Mediap->M_drivep->d_strmcontextp = (void *)strctxp;
@@ -1890,7 +1948,7 @@ content_stream_restore( ix_t thrdix )
 			unlock( );
 			sleep( 1 );
 			if ( cldmgr_stop_requested( )) {
-				return EXIT_NORMAL;
+				return mlog_exit(EXIT_NORMAL, RV_INTR);
 			}
 			continue;
 		}
@@ -1907,7 +1965,7 @@ content_stream_restore( ix_t thrdix )
 		     * into pi, and makes persp->s.dumpid valid.
 		     */
 		if ( ok == BOOL_ERROR ) {
-			return EXIT_ERROR;
+			return mlog_exit(EXIT_ERROR, RV_OPT);
 		}
 		tranp->t_dumpidknwnpr = ok;
 		tranp->t_sync1 = SYNC_DONE;
@@ -1954,11 +2012,11 @@ content_stream_restore( ix_t thrdix )
 		case RV_QUIT:
 		case RV_DRIVE:
 			Media_end( Mediap );
-			return EXIT_NORMAL;
+			return mlog_exit(EXIT_NORMAL, rv);
 		case RV_CORE:
 		default:
 			Media_end( Mediap );
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, rv);
 		}
 		dcaps = drivep->d_capabilities;
 
@@ -1968,7 +2026,7 @@ content_stream_restore( ix_t thrdix )
 			sleep( 1 );
 			if ( cldmgr_stop_requested( )) {
 				Media_end( Mediap );
-				return EXIT_NORMAL;
+				return mlog_exit(EXIT_NORMAL, RV_INTR);
 			}
 			lock( );
 		}
@@ -2052,7 +2110,7 @@ content_stream_restore( ix_t thrdix )
 		}
 		if ( cldmgr_stop_requested( )) {
 			Media_end( Mediap );
-			return EXIT_NORMAL;
+			return mlog_exit(EXIT_NORMAL, RV_INTR);
 		}
 		if ( ! matchpr ) {
 			Media_end( Mediap );
@@ -2063,26 +2121,24 @@ content_stream_restore( ix_t thrdix )
 			     ( ! ( dcaps & DRIVE_CAP_FILES )
 			       &&
 			       ! ( dcaps & DRIVE_CAP_REMOVABLE ))) {
-				return EXIT_NORMAL;
+				return mlog_exit(EXIT_NORMAL, RV_QUIT);
 			}
 			continue;
 		}
 		if ( ! dumpcompat( resumepr, level, *baseidp, BOOL_TRUE )) {
 			Media_end( Mediap );
-			return EXIT_ERROR;
+			return mlog_exit(EXIT_ERROR, RV_COMPAT);
 		}
 		strncpyterm( persp->s.dumplab,
 			     grhdrp->gh_dumplabel,
 			     sizeof( persp->s.dumplab ));
 		sessp = 0;
 
-#ifdef PIPEINVFIX
 		/* don't look at the online inventory if the input is piped
 		 */
 		if ( ! drivep->d_isnamedpipepr
 		     &&
 		     ! drivep->d_isunnamedpipepr ) {
-#endif /* PIPEINVFIX */
 			ok = inv_get_session_byuuid( &grhdrp->gh_dumpid,
 						     &sessp );
 			if ( ok && sessp ) {
@@ -2091,9 +2147,7 @@ content_stream_restore( ix_t thrdix )
 				persp->s.fullinvpr = pi_transcribe( sessp );
 				inv_free_session( &sessp );
 			}
-#ifdef PIPEINVFIX
 		}
-#endif /* PIPEINVFIX */
 		fileh = pi_addfile( Mediap,
 				    grhdrp,
 				    drhdrp,
@@ -2104,7 +2158,7 @@ content_stream_restore( ix_t thrdix )
 			 * if this is a match
 			 */
 		if ( fileh == DH_NULL ) {
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, RV_ERROR);
 		}
 		uuid_copy(persp->s.dumpid,grhdrp->gh_dumpid);
 		persp->s.begintime = time( 0 );
@@ -2144,11 +2198,11 @@ content_stream_restore( ix_t thrdix )
 		case RV_QUIT:
 		case RV_DRIVE:
 			Media_end( Mediap );
-			return EXIT_NORMAL;
+			return mlog_exit(EXIT_NORMAL, rv);
 		case RV_CORE:
 		default:
 			Media_end( Mediap );
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, rv);
 		}
 		dcaps = drivep->d_capabilities;
 		ASSERT( fileh != DH_NULL );
@@ -2175,7 +2229,7 @@ content_stream_restore( ix_t thrdix )
 			sleep( 1 );
 			if ( cldmgr_stop_requested( )) {
 				Media_end( Mediap );
-				return EXIT_NORMAL;
+				return mlog_exit(EXIT_NORMAL, RV_INTR);
 			}
 			lock( );
 		}
@@ -2196,7 +2250,7 @@ content_stream_restore( ix_t thrdix )
 					   scrhdrp->cih_inomap_dircnt );
 			if ( ! ok ) {
 				Media_end( Mediap );
-				return EXIT_ERROR;
+				return mlog_exit(EXIT_ERROR, RV_ERROR);
 			}
 			tranp->t_dirattrinitdonepr = BOOL_TRUE;
 		}
@@ -2211,7 +2265,7 @@ content_stream_restore( ix_t thrdix )
 					  scrhdrp->cih_inomap_nondircnt );
 			if ( ! ok ) {
 				Media_end( Mediap );
-				return EXIT_ERROR;
+				return mlog_exit(EXIT_ERROR, RV_ERROR);
 			}
 			tranp->t_namreginitdonepr = BOOL_TRUE;
 		}
@@ -2244,7 +2298,7 @@ content_stream_restore( ix_t thrdix )
 					persp->a.dstdirisxfspr );
 			if ( ! ok ) {
 				Media_end( Mediap );
-				return EXIT_ERROR;
+				return mlog_exit(EXIT_ERROR, RV_ERROR);
 			}
 			tranp->t_treeinitdonepr = BOOL_TRUE;
 		}
@@ -2275,11 +2329,11 @@ content_stream_restore( ix_t thrdix )
 		case RV_INTR:
 		case RV_DRIVE:
 			Media_end( Mediap );
-			return EXIT_NORMAL;
+			return mlog_exit(EXIT_NORMAL, rv);
 		case RV_CORE:
 		default:
 			Media_end( Mediap );
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, rv);
 		}
 	}
 
@@ -2314,7 +2368,7 @@ content_stream_restore( ix_t thrdix )
 			sleep( 1 );
 			if ( cldmgr_stop_requested( )) {
 				Media_end( Mediap );
-				return EXIT_NORMAL;
+				return mlog_exit(EXIT_NORMAL, RV_INTR);
 			}
 			lock( );
 		}
@@ -2334,14 +2388,14 @@ content_stream_restore( ix_t thrdix )
 			break;
 		case RV_ERROR:
 			Media_end( Mediap );
-			return EXIT_ERROR;
+			return mlog_exit(EXIT_ERROR, RV_ERROR);
 		case RV_INTR:
 			Media_end( Mediap );
-			return EXIT_INTERRUPT;
+			return mlog_exit(EXIT_INTERRUPT, RV_INTR);
 		case RV_CORE:
 		default:
 			Media_end( Mediap );
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, rv);
 		}
 
 		/* now that we have a tree and inomap, scan the
@@ -2394,11 +2448,11 @@ content_stream_restore( ix_t thrdix )
 		case RV_QUIT:
 		case RV_DRIVE:
 			Media_end( Mediap );
-			return EXIT_NORMAL;
+			return mlog_exit(EXIT_NORMAL, rv);
 		case RV_CORE:
 		default:
 			Media_end( Mediap );
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, rv);
 		}
 		dcaps = drivep->d_capabilities;
 		ASSERT( fileh > DH_NULL );
@@ -2431,19 +2485,17 @@ content_stream_restore( ix_t thrdix )
 		switch ( rv ) {
 		case RV_OK:
 			DH2F( fileh )->f_nondirdonepr = BOOL_TRUE;
-#ifdef EOMFIX
 			Media_end( Mediap );
-#endif /* EOMFIX */
 			break;
 		case RV_INTR:
 		case RV_DRIVE:
 		case RV_INCOMPLETE:
 			Media_end( Mediap );
-			return EXIT_NORMAL;
+			return mlog_exit(EXIT_NORMAL, rv);
 		case RV_CORE:
 		default:
 			Media_end( Mediap );
-			return EXIT_FAULT;
+			return mlog_exit(EXIT_FAULT, rv);
 		}
 	}
 
@@ -2460,10 +2512,7 @@ content_stream_restore( ix_t thrdix )
 	lock( );
 	if ( tranp->t_sync5 == SYNC_BUSY ) {
 		unlock( );
-#ifndef EOMFIX
-		Media_end( Mediap );
-#endif /* ! EOMFIX */
-		return EXIT_NORMAL;
+		return mlog_exit(EXIT_NORMAL, RV_DONE);
 	}
 	tranp->t_sync5 = SYNC_BUSY;
 	unlock( );
@@ -2480,33 +2529,15 @@ content_stream_restore( ix_t thrdix )
 	mlog( MLOG_DEBUG,
 	      "tree finalize\n" );
 	rv = finalize( path1, path2 );
-	switch ( rv ) {
-	case RV_OK:
-		break;
-	case RV_ERROR:
-#ifndef EOMFIX
-		Media_end( Mediap );
-#endif /* ! EOMFIX */
-		return EXIT_ERROR;
-	case RV_INTR:
-#ifndef EOMFIX
-		Media_end( Mediap );
-#endif /* ! EOMFIX */
-		return EXIT_NORMAL;
-	case RV_CORE:
-	default:
-#ifndef EOMFIX
-		Media_end( Mediap );
-#endif /* ! EOMFIX */
-		return EXIT_FAULT;
+	if (rv == RV_OK || rv == RV_INTR) {
+		rval = EXIT_NORMAL;
+	} else if (rv == RV_ERROR) {
+		rval = EXIT_ERROR;
+	} else {
+		rval = EXIT_FAULT;
 	}
 
-	/* made it! I'm last, now exit
-	 */
-#ifndef EOMFIX
-	Media_end( Mediap );
-#endif /* ! EOMFIX */
-	return EXIT_NORMAL;
+	return mlog_exit(rval, rv);
 }
 
 /* called after all threads have exited. scans state to decide
@@ -3026,7 +3057,7 @@ applydirdump( drive_t *drivep,
 			return rv;
 		}
 
-		if ((rv = namreg_flush()) != RV_OK) {
+		if ((rv = namreg_map()) != RV_OK) {
 			return rv;
 		}
 
@@ -6354,9 +6385,6 @@ pi_hiteod( ix_t strmix, ix_t objix )
 static void
 pi_hiteom( ix_t strmix, ix_t objix )
 {
-#ifndef EOMFIX
-	pi_seestrmend( strmix );
-#endif /* ! EOMFIX */
 	pi_seeobjstrmend( strmix, objix );
 }
 
@@ -7171,9 +7199,7 @@ restore_file_cb( void *cp, bool_t linkpr, char *path1, char *path2 )
 #ifdef S_IFNAM
 		case S_IFNAM:
 #endif
-#ifdef DOSOCKS
 		case S_IFSOCK:
-#endif /* DOSOCKS */
 			ok = restore_spec( fhdrp, rvp, path1 );
 			return ok;
 		case S_IFLNK:
@@ -7625,11 +7651,9 @@ restore_spec( filehdr_t *fhdrp, rv_t *rvp, char *path )
 		printstr = _("XENIX named pipe");
 		break;
 #endif
-#ifdef DOSOCKS
 	case S_IFSOCK:
 		printstr = _("UNIX domain socket");
 		break;
-#endif /* DOSOCKS */
 	default:
 		mlog( MLOG_NORMAL | MLOG_WARNING, _(
 		      "%s: unknown file type: mode 0x%x ino %llu\n"),
@@ -7652,7 +7676,6 @@ restore_spec( filehdr_t *fhdrp, rv_t *rvp, char *path )
 	}
 
 	if ( ! tranp->t_toconlypr ) {
-#ifdef DOSOCKS
 		if ( ( bstatp->bs_mode & S_IFMT ) == S_IFSOCK ) {
 			int sockfd;
 			struct sockaddr_un addr;
@@ -7700,29 +7723,25 @@ restore_spec( filehdr_t *fhdrp, rv_t *rvp, char *path )
 				return BOOL_TRUE;
 			}
 			( void )close( sockfd );
-			goto sockbypass;
-		}
-#endif /* DOSOCKS */
 
-		/* create the node
-		 */
-		rval = mknod( path,
-			      ( mode_t )bstatp->bs_mode,
-			      ( dev_t )IRIX_DEV_TO_KDEVT(bstatp->bs_rdev));
-		if ( rval && rval != EEXIST ) {
-			mlog( MLOG_VERBOSE | MLOG_WARNING, _(
-			      "unable to create %s "
-			      "ino %llu %s: %s: discarding\n"),
-			      printstr,
-			      fhdrp->fh_stat.bs_ino,
-			      path,
-			      strerror( errno ));
-			return BOOL_TRUE;
+		} else {
+			/* create the node
+			*/
+			rval = mknod( path,
+				      ( mode_t )bstatp->bs_mode,
+				      ( dev_t )IRIX_DEV_TO_KDEVT(bstatp->bs_rdev));
+			if ( rval && rval != EEXIST ) {
+				mlog( MLOG_VERBOSE | MLOG_WARNING, _(
+				      "unable to create %s "
+				      "ino %llu %s: %s: discarding\n"),
+				      printstr,
+				      fhdrp->fh_stat.bs_ino,
+				      path,
+				      strerror( errno ));
+				return BOOL_TRUE;
+			}
 		}
 
-#ifdef DOSOCKS
-sockbypass:
-#endif /* DOSOCKS */
 		/* set the owner and group (if enabled)
 		 */
 		if ( persp->a.ownerpr ) {
@@ -7918,11 +7937,6 @@ read_filehdr( drive_t *drivep, filehdr_t *fhdrp, bool_t fhcs )
 	drive_ops_t *dop = drivep->d_opsp;
 	/* REFERENCED */
 	intgen_t nread;
-#ifdef FILEHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )fhdrp;
-	register u_int32_t *endp = ( u_int32_t * )( fhdrp + 1 );
-	register u_int32_t sum;
-#endif /* FILEHDR_CHECKSUM */
 	intgen_t rval;
 	filehdr_t tmpfh;
 
@@ -7959,21 +7973,18 @@ read_filehdr( drive_t *drivep, filehdr_t *fhdrp, bool_t fhcs )
 	      bstatp->bs_ino,
 	      bstatp->bs_mode );
 
-#ifdef FILEHDR_CHECKSUM
 	if ( fhcs ) {
 		if ( ! ( fhdrp->fh_flags & FILEHDR_FLAGS_CHECKSUM )) {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "corrupt file header\n") );
 			return RV_CORRUPT;
 		}
-		for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-		if ( sum ) {
+		if ( !is_checksum_valid( fhdrp, FILEHDR_SZ )) {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "bad file header checksum\n") );
 			return RV_CORRUPT;
 		}
 	}
-#endif /* FILEHDR_CHECKSUM */
 
 	return RV_OK;
 }
@@ -7985,11 +7996,6 @@ read_extenthdr( drive_t *drivep, extenthdr_t *ehdrp, bool_t ehcs )
 	drive_ops_t *dop = drivep->d_opsp;
 	/* REFERENCED */
 	intgen_t nread;
-#ifdef EXTENTHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )ehdrp;
-	register u_int32_t *endp = ( u_int32_t * )( ehdrp + 1 );
-	register u_int32_t sum;
-#endif /* EXTENTHDR_CHECKSUM */
 	intgen_t rval;
 	extenthdr_t tmpeh;
 
@@ -8026,21 +8032,18 @@ read_extenthdr( drive_t *drivep, extenthdr_t *ehdrp, bool_t ehcs )
 	      ehdrp->eh_type,
 	      ehdrp->eh_flags );
 
-#ifdef EXTENTHDR_CHECKSUM
 	if ( ehcs ) {
 		if ( ! ( ehdrp->eh_flags & EXTENTHDR_FLAGS_CHECKSUM )) {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "corrupt extent header\n") );
 			return RV_CORRUPT;
 		}
-		for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-		if ( sum ) {
+		if ( !is_checksum_valid( ehdrp, EXTENTHDR_SZ )) {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "bad extent header checksum\n") );
 			return RV_CORRUPT;
 		}
 	}
-#endif /* EXTENTHDR_CHECKSUM */
 
 	return RV_OK;
 }
@@ -8055,11 +8058,6 @@ read_dirent( drive_t *drivep,
 	drive_ops_t *dop = drivep->d_opsp;
 	/* REFERENCED */
 	intgen_t nread;
-#ifdef DIRENTHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )dhdrp;
-	register u_int32_t *endp = ( u_int32_t * )( dhdrp + 1 );
-	register u_int32_t sum;
-#endif /* DIRENTHDR_CHECKSUM */
 	intgen_t rval;
 	direnthdr_t tmpdh;
 
@@ -8098,21 +8096,18 @@ read_dirent( drive_t *drivep,
 	      ( size_t )dhdrp->dh_gen,
 	      ( size_t )dhdrp->dh_sz );
 
-#ifdef DIRENTHDR_CHECKSUM
 	if ( dhcs ) {
 		if ( dhdrp->dh_sz == 0 ) {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "corrupt directory entry header\n") );
 			return RV_CORRUPT;
 		}
-		for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-		if ( sum ) {
+		if ( !is_checksum_valid( dhdrp, DIRENTHDR_SZ )) {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "bad directory entry header checksum\n") );
 			return RV_CORRUPT;
 		}
 	}
-#endif /* DIRENTHDR_CHECKSUM */
 
 	/* if null, return
 	 */
@@ -8164,11 +8159,6 @@ read_extattrhdr( drive_t *drivep, extattrhdr_t *ahdrp, bool_t ahcs )
 	drive_ops_t *dop = drivep->d_opsp;
 	/* REFERENCED */
 	intgen_t nread;
-#ifdef EXTATTRHDR_CHECKSUM
-	register u_int32_t *sump = ( u_int32_t * )ahdrp;
-	register u_int32_t *endp = ( u_int32_t * )( ahdrp + 1 );
-	register u_int32_t sum;
-#endif /* EXTATTRHDR_CHECKSUM */
 	intgen_t rval;
 	extattrhdr_t tmpah;
 
@@ -8206,21 +8196,31 @@ read_extattrhdr( drive_t *drivep, extattrhdr_t *ahdrp, bool_t ahcs )
 	      ahdrp->ah_valsz,
 	      ahdrp->ah_checksum );
 
-#ifdef EXTATTRHDR_CHECKSUM
 	if ( ahcs ) {
-		if ( ! ( ahdrp->ah_flags & EXTATTRHDR_FLAGS_CHECKSUM )) {
+		if ( ahdrp->ah_flags & EXTATTRHDR_FLAGS_CHECKSUM ) {
+			if ( !is_checksum_valid( ahdrp, EXTATTRHDR_SZ )) {
+				mlog( MLOG_NORMAL | MLOG_WARNING, _(
+					"bad extattr header checksum\n") );
+				return RV_CORRUPT;
+			}
+		} else if ( ahdrp->ah_flags & EXTATTRHDR_FLAGS_OLD_CHECKSUM ) {
+			/* possibly a corrupt header, but most likely an old
+			 * header, which cannot be verified due to a bug in how
+			 * its checksum was calculated.
+			 */
+			static bool_t warned = BOOL_FALSE;
+			if ( !warned ) {
+				mlog( MLOG_NORMAL | MLOG_WARNING, _(
+					"ignoring old-style extattr "
+					"header checksums\n") );
+				warned = BOOL_TRUE;
+			}
+		} else {
 			mlog( MLOG_NORMAL | MLOG_WARNING, _(
 			      "corrupt extattr header\n") );
 			return RV_CORRUPT;
 		}
-		for ( sum = 0 ; sump < endp ; sum += *sump++ ) ;
-		if ( sum ) {
-			mlog( MLOG_NORMAL | MLOG_WARNING, _(
-			      "bad extattr header checksum\n") );
-			return RV_CORRUPT;
-		}
 	}
-#endif /* EXTATTRHDR_CHECKSUM */
 
 	return RV_OK;
 }

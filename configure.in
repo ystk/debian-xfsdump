@@ -1,4 +1,5 @@
 AC_INIT(common/main.c)
+AC_PREREQ(2.50)
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_HEADER(include/config.h)
@@ -41,11 +42,16 @@ esac
 case $exec_prefix:$prefix in
 NONE:NONE | NONE:/usr | /usr:*)
   root_sbindir='/sbin'
-  AC_SUBST([root_sbindir])
-
   root_libdir="/${base_libdir}"
-  AC_SUBST([root_libdir])
+  ;;
+*)
+  root_sbindir="${sbindir}"
+  root_libdir="${libdir}"
+  ;;
 esac
+
+AC_SUBST([root_sbindir])
+AC_SUBST([root_libdir])
 
 # Find localized files
 LOCALIZED_FILES=""

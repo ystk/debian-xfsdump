@@ -19,7 +19,9 @@
 #include <xfs/xfs.h>
 #include <xfs/jdm.h>
 
+#include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <time.h>
 #include <errno.h>
@@ -30,13 +32,12 @@
 #include "dlog.h"
 #include "getopt.h"
 
-extern bool_t miniroot;
-extern pid_t parentpid;
-
 static int dlog_ttyfd = -1;
-static bool_t dlog_allowed_flag = BOOL_FALSE;
+static volatile bool_t dlog_allowed_flag = BOOL_FALSE;
 static bool_t dlog_timeouts_flag = BOOL_FALSE;
 static char *promptstr = " -> ";
+
+static sigset_t dlog_registered_sigs;
 
 static bool_t promptinput( char *buf,
 			   size_t bufsz,
@@ -48,7 +49,6 @@ static bool_t promptinput( char *buf,
 			   ix_t sigquitix,
 			   char *fmt, ... );
 static void dlog_string_query_print( void *ctxp, char *fmt, ... );
-static void sighandler( int );
 
 bool_t
 dlog_init( int argc, char *argv[ ] )
@@ -64,6 +64,8 @@ dlog_init( int argc, char *argv[ ] )
 	dlog_ttyfd = 0; /* stdin */
 	dlog_allowed_flag = BOOL_TRUE;
 	dlog_timeouts_flag = BOOL_TRUE;
+
+	sigemptyset( &dlog_registered_sigs );
 
 	/* look for command line option claiming the operator knows
 	 * what's up.
@@ -131,7 +133,6 @@ void
 dlog_desist( void )
 {
 	dlog_allowed_flag = BOOL_FALSE;
-	dlog_ttyfd = -1;
 }
 
 intgen_t
@@ -186,7 +187,6 @@ dlog_multi_query( char *querystr[ ],
 	/* sanity
 	 */
 	ASSERT( dlog_allowed_flag );
-	ASSERT( choicecnt < 9 );
 
 	/* display query description strings
 	 */
@@ -245,24 +245,21 @@ dlog_multi_query( char *querystr[ ],
 				  prepromptstr,
 				  choicecnt );
 		if ( ok ) {
+			long int val;
+			char *end = buf;
+
 			if ( ! strlen( buf )) {
 				return defaultix;
 			}
-			if ( strlen( buf ) != 1 ) {
+
+			val = strtol( buf, &end, 10 );
+			if ( *end != '\0' || val < 1 || val > choicecnt ) {
 				prepromptstr = _(
-				    "please enter a single "
-				    "digit response (1 to %d)");
-				continue;
-			}
-			if ( buf[ 0 ] < '1'
-			     ||
-			     buf[ 0 ] >= '1' + ( u_char_t )choicecnt ) {
-				prepromptstr = _(
-				      "please enter a single digit "
+				      "please enter a value "
 				      "between 1 and %d inclusive ");
 				continue;
 			}
-			return ( size_t )( buf[ 0 ] - '1' );
+			return val - 1; // return value is a 0-based index
 		} else {
 			return exceptionix;
 		}
@@ -295,6 +292,10 @@ dlog_string_query( dlog_ucbp_t ucb, /* user's print func */
 {
 	ix_t exceptionix;
 	bool_t ok;
+
+	/* sanity
+	 */
+	ASSERT( dlog_allowed_flag );
 
 	/* call the caller's callback with his context, print context, and
 	 * print operator
@@ -339,12 +340,17 @@ dlog_string_ack( char *ackstr[ ], size_t ackcnt )
 
 /* ok that this is a static, since used under mutual exclusion lock
  */
-static int dlog_signo_received;
+static volatile int dlog_signo_received;
 
-static void
-sighandler( int signo )
+bool_t
+dlog_sighandler( int signo )
 {
+	if ( sigismember( &dlog_registered_sigs, signo ) < 1 )
+		return BOOL_FALSE;
+	// only process the first signal
+	sigemptyset( &dlog_registered_sigs );
 	dlog_signo_received = signo;
+	return BOOL_TRUE;
 }
 
 /* ARGSUSED */
@@ -373,14 +379,9 @@ promptinput( char *buf,
 	     ... )
 {
 	va_list args;
-	u_intgen_t alarm_save = 0;
-	void (* sigalrm_save)(int) = NULL;
-	void (* sigint_save)(int) = NULL;
-	void (* sighup_save)(int) = NULL;
-	void (* sigterm_save)(int) = NULL;
-	void (* sigquit_save)(int) = NULL;
-	intgen_t nread;
-	pid_t pid = getpid( );
+	time32_t now = time( NULL );
+	intgen_t nread = -1;
+	sigset_t orig_set;
 
 	/* display the pre-prompt
 	 */
@@ -399,80 +400,68 @@ promptinput( char *buf,
 #endif /* NOTYET */
 	mlog( MLOG_NORMAL | MLOG_NOLOCK | MLOG_BARE, promptstr );
 
-	/* set up signal handling
+	/* set up timeout
 	 */
-	dlog_signo_received = -1;
 	if ( dlog_timeouts_flag && timeoutix != IXMAX ) {
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sigrelse( SIGALRM );
-		}
-		sigalrm_save = sigset( SIGALRM, sighandler );
-		alarm_save = alarm( ( u_intgen_t )timeout );
-	}
-	if ( sigintix != IXMAX ) {
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sigrelse( SIGINT );
-		}
-		sigint_save = sigset( SIGINT, sighandler );
-	}
-	if ( sighupix != IXMAX ) {
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sigrelse( SIGHUP );
-		}
-		sighup_save = sigset( SIGHUP, sighandler );
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sigrelse( SIGTERM );
-		}
-		sigterm_save = sigset( SIGTERM, sighandler );
-	}
-	if ( sigquitix != IXMAX ) {
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sigrelse( SIGQUIT );
-		}
-		sigquit_save = sigset( SIGQUIT, sighandler );
+		timeout += now;
+	} else {
+		timeout = TIMEMAX;
 	}
 
-	/* wait for input, timeout, or interrupt
+	/* set up signal handling
+	 * the mlog lock is held for the life of the dialog (see dlog_begin)
+	 * and it's possible the main thread, which normally does the signal
+	 * handling, is now waiting on the mlog lock trying to log a message.
+	 * so unblock the relevant signals for this thread. note this means
+	 * the current thread or the main thread might handle one of these
+	 * signals.
 	 */
-	ASSERT( dlog_ttyfd >= 0 );
-	nread = read( dlog_ttyfd, buf, bufsz - 1 );
+	dlog_signo_received = -1;
+	sigemptyset( &dlog_registered_sigs );
+	if ( sigintix != IXMAX ) {
+		sigaddset( &dlog_registered_sigs, SIGINT );
+	}
+	if ( sighupix != IXMAX ) {
+		sigaddset( &dlog_registered_sigs, SIGHUP );
+		sigaddset( &dlog_registered_sigs, SIGTERM );
+	}
+	if ( sigquitix != IXMAX ) {
+		sigaddset( &dlog_registered_sigs, SIGQUIT );
+	}
+
+	sigprocmask( SIG_UNBLOCK, &dlog_registered_sigs, &orig_set );
+
+	/* wait for input, timeout, or interrupt.
+	 * note we come out of the select() frequently in order to
+	 * check for a signal. the signal may have been handled by the
+	 * the main thread, so we can't rely on the signal waking us
+	 * up from the select().
+	 */
+	while ( now < timeout && dlog_signo_received == -1 && dlog_allowed_flag ) {
+		int rc;
+		fd_set rfds;
+		struct timeval tv = { 0, 100000 }; // 100 ms
+
+		FD_ZERO( &rfds );
+		FD_SET( dlog_ttyfd, &rfds );
+
+		rc = select( dlog_ttyfd + 1, &rfds, NULL, NULL, &tv );
+		if ( rc > 0 && FD_ISSET( dlog_ttyfd, &rfds ) ) {
+			nread = read( dlog_ttyfd, buf, bufsz - 1 );
+			break;
+		}
+		now = time( NULL );
+	}
 
 	/* restore signal handling
 	 */
-	if ( sigquitix != IXMAX ) {
-		( void )sigset( SIGQUIT, sigquit_save );
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sighold( SIGQUIT );
-		}
-	}
-	if ( sighupix != IXMAX ) {
-		( void )sigset( SIGHUP, sighup_save );
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sighold( SIGHUP );
-		}
-		( void )sigset( SIGTERM, sigterm_save );
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sighold( SIGTERM );
-		}
-	}
-	if ( sigintix != IXMAX ) {
-		( void )sigset( SIGINT, sigint_save );
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sighold( SIGINT );
-		}
-	}
-	if ( dlog_timeouts_flag && timeoutix != IXMAX ) {
-		( void )alarm( alarm_save );
-		( void )sigset( SIGALRM, sigalrm_save );
-		if ( pid == parentpid && ! miniroot ) {
-			( void )sighold( SIGALRM );
-		}
-	}
+	sigprocmask( SIG_SETMASK, &orig_set, NULL );
+	sigemptyset( &dlog_registered_sigs );
 	
 	/* check for timeout or interrupt
 	 */
 	if ( nread < 0 ) {
-		if ( dlog_signo_received == SIGALRM ) {
+		if ( now >= timeout ) {
 			mlog( MLOG_NORMAL | MLOG_NOLOCK | MLOG_BARE,
 			      _("timeout\n") );
 			*exceptionixp = timeoutix;
@@ -496,8 +485,7 @@ promptinput( char *buf,
 			*exceptionixp = sigquitix;
 		} else {
 			mlog( MLOG_NORMAL | MLOG_NOLOCK | MLOG_BARE,
-			      _("unknown signal during dialog: %d\n"),
-			      dlog_signo_received );
+			      _("abnormal dialog termination\n"));
 			*exceptionixp = sigquitix;
 		}
 		return BOOL_FALSE;
