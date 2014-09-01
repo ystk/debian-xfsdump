@@ -28,7 +28,9 @@ SRCDIR = $(PKG_NAME)-$(PKG_VERSION)
 SRCTAR = $(PKG_NAME)-$(PKG_VERSION).tar.gz
 
 CONFIGURE = aclocal.m4 configure config.guess config.sub install-sh ltmain.sh
-LSRCFILES = configure.in release.sh README VERSION $(CONFIGURE)
+LSRCFILES = configure.ac release.sh README VERSION $(CONFIGURE)
+SRCTARINC = m4/libtool.m4 m4/lt~obsolete.m4 m4/ltoptions.m4 m4/ltsugar.m4 \
+            m4/ltversion.m4 .gitcensus $(CONFIGURE)
 
 LDIRT = config.log .ltdep .dep config.status config.cache confdefs.h \
 	conftest* built .census install.* install-dev.* *.gz \
@@ -98,7 +100,7 @@ distclean: clean
 	rm -f $(LDIRT)
 
 realclean: distclean
-	rm -f $(CONFIGURE)
+	rm -f $(CONFIGURE) .gitcensus
 
 #
 # All this gunk is to allow for a make dist on an unconfigured tree
@@ -115,16 +117,19 @@ ifeq ($(HAVE_BUILDDEFS), no)
 	$(MAKE) $(MAKEOPTS) -C . $@
 else
 	$(Q)$(MAKE) $(MAKEOPTS) $(SRCDIR)
-	$(Q)$(MAKE) $(MAKEOPTS) -C po
-	$(Q)$(MAKE) $(MAKEOPTS) source-link
 	$(Q)cd $(SRCDIR) && dpkg-buildpackage
 endif
 
-$(SRCDIR) : $(_FORCE)
+$(SRCDIR) : $(_FORCE) $(SRCTAR)
 	rm -fr $@
-	mkdir -p $@
+	$(Q)$(TAR) -zxvf $(SRCTAR)
 
-$(SRCTAR) : default $(SRCDIR)
-	$(Q)$(MAKE) $(MAKEOPTS) source-link
-	unset TAPE; $(TAR) -cf - $(SRCDIR) | $(ZIP) --best > $@ && \
+$(SRCTAR) : default $(SRCTARINC) .gitcensus
+	$(Q)$(TAR) --transform "s,^,$(SRCDIR)/," -zcf $(SRCDIR).tar.gz \
+	  `cat .gitcensus` $(SRCTARINC)
 	echo Wrote: $@
+
+.gitcensus: $(_FORCE)
+	$(Q) if test -d .git; then \
+	  git ls-files > .gitcensus && echo "new .gitcensus"; \
+	fi

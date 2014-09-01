@@ -27,7 +27,7 @@
  * facilitating easy changes.
  */
 
-#define GETOPT_CMDSTRING	"ab:c:d:ef:hl:mop:qs:t:v:z:AB:CEFG:H:I:JL:M:NO:PRSTUVWY:Z"
+#define GETOPT_CMDSTRING	"ab:c:d:ef:hl:mop:qs:t:v:z:AB:CDEFG:H:I:JKL:M:NO:PRSTUVWY:"
 
 #define GETOPT_DUMPASOFFLINE	'a'	/* dump DMF dualstate files as offline */
 #define	GETOPT_BLOCKSIZE	'b'	/* blocksize for rmt */
@@ -58,14 +58,14 @@
 #define	GETOPT_NOEXTATTR	'A'	/* do not dump ext. file attributes */
 #define	GETOPT_BASED		'B'	/* specify session to base increment */
 #define GETOPT_RECCHKSUM	'C'	/* use record checksums */
-/*				'D'	*/
+#define GETOPT_NOUNCHANGEDDIRS	'D'	/* skip unchanged directories */
 #define	GETOPT_ERASE		'E'	/* pre-erase media */
 #define GETOPT_FORCE		'F'	/* don't prompt (getopt.c) */
 #define GETOPT_MINSTACKSZ	'G'	/* minimum stack size (bytes) */
 #define GETOPT_MAXSTACKSZ	'H'	/* maximum stack size (bytes) */
 #define GETOPT_INVPRINT         'I'     /* just display the inventory */
 #define	GETOPT_NOINVUPDATE	'J'	/* do not update the dump inventory */
-/*				'K'	*/
+#define GETOPT_FMT2COMPAT	'K'	/* use dump format 2 for compat with old restore */
 #define	GETOPT_DUMPLABEL	'L'	/* dump session label (global.c) */
 #define	GETOPT_MEDIALABEL	'M'	/* media object label (media.c) */
 #define	GETOPT_TIMESTAMP	'N'	/* show timestamps in log msgs */
@@ -80,6 +80,6 @@
 #define	GETOPT_SHOWLOGLEVEL	'W'	/* show level of log messages */
 /*				'X'	*/
 #define	GETOPT_RINGLEN		'Y'	/* specify I/O buffer ring length */
-#define	GETOPT_MINIROOT		'Z'	/* apply miniroot restrictions */
+/*				'Z'	   used on irix for miniroot */
 
 #endif /* GETOPT_H */

@@ -64,9 +64,6 @@
 #include "getdents.h"
 #include "arch_xlate.h"
 
-#undef SYNCDIR
-#define SYNCDIR
-
 /* max "unsigned long long int"
  */
 #define ULONGLONG_MAX	18446744073709551615LLU
@@ -231,7 +228,6 @@ typedef struct extent_group_context extent_group_context_t;
 struct pds {
 	enum { PDS_NULL,		/* per-drive activity not begun */
 	       PDS_INOMAP,		/* dumping inomap */
-	       PDS_DIRRENDEZVOUS,	/* waiting to dump dirs */
 	       PDS_DIRDUMP,		/* dumping dirs */
 	       PDS_NONDIR,		/* dumping nondirs */
 	       PDS_INVSYNC,		/* waiting for inventory */
@@ -248,7 +244,6 @@ typedef struct pds pds_t;
 extern void usage( void );
 extern bool_t preemptchk( int );
 extern char *homedir;
-extern bool_t miniroot;
 extern bool_t pipeline;
 extern bool_t stdoutpiped;
 extern char *sistr;
@@ -263,9 +258,6 @@ static rv_t dump_dirs( ix_t strmix,
 		       xfs_bstat_t *bstatbufp,
 		       size_t bstatbuflen,
 		       void *inomap_contextp );
-#ifdef SYNCDIR
-static rv_t dump_dirs_rendezvous( void );
-#endif /* SYNCDIR */
 static rv_t dump_dir( ix_t strmix,
 		      jdm_fshandle_t *,
 		      intgen_t,
@@ -278,7 +270,8 @@ static rv_t dump_file_reg( drive_t *drivep,
 			   context_t *contextp,
 			   content_inode_hdr_t *scwhdrp,
 			   jdm_fshandle_t *,
-			   xfs_bstat_t * );
+			   xfs_bstat_t *,
+			   bool_t *);
 static rv_t dump_file_spec( drive_t *drivep,
 			    context_t *contextp,
 			    jdm_fshandle_t *,
@@ -298,7 +291,7 @@ static rv_t dump_dirent( drive_t *drivep,
 			 context_t *contextp,
 			 xfs_bstat_t *,
 			 xfs_ino_t,
-			 u_int32_t,
+			 gen_t,
 			 char *,
 			 size_t );
 static rv_t init_extent_group_context( jdm_fshandle_t *,
@@ -485,12 +478,10 @@ static bool_t sc_dumpextattrpr = BOOL_TRUE;
 static bool_t sc_dumpasoffline = BOOL_FALSE;
 	/* dump dual-residency HSM files as offline
 	 */
-#ifdef SYNCDIR
-static size_t sc_thrdsdirdumpsynccnt = 0;
-static size_t sc_thrdswaitingdirdumpsync1 = 0;
-static size_t sc_thrdswaitingdirdumpsync2 = 0;
-static qbarrierh_t sc_barrierh;
-#endif /* SYNCDIR */
+static bool_t sc_use_old_direntpr = BOOL_FALSE;
+	/* dump dirents as dirent_v1_t instead of dirent_t
+	 * (for compat with dump format 2)
+	 */
 
 static bool_t sc_savequotas = BOOL_TRUE;
 /* save quota information in dump
@@ -533,6 +524,7 @@ content_init( intgen_t argc,
 	char mntpnt[ GLOBAL_HDR_STRING_SZ ];
 	char fsdevice[ GLOBAL_HDR_STRING_SZ ];
 	char fstype[ CONTENT_HDR_FSTYPE_SZ ];
+	bool_t skip_unchanged_dirs = BOOL_FALSE;
 	uuid_t fsid;
 	bool_t underfoundpr;
 	ix_t underlevel = ( ix_t )( -1 );
@@ -573,6 +565,7 @@ content_init( intgen_t argc,
 	ASSERT( sizeof( filehdr_t ) == FILEHDR_SZ );
 	ASSERT( sizeof( extenthdr_t ) == EXTENTHDR_SZ );
 	ASSERT( sizeof( direnthdr_t ) == DIRENTHDR_SZ );
+	ASSERT( sizeof( direnthdr_v1_t ) == DIRENTHDR_SZ );
 	ASSERT( DIRENTHDR_SZ % DIRENTHDR_ALIGN == 0 );
 	ASSERT( sizeofmember( content_hdr_t, ch_specific )
 		>=
@@ -585,6 +578,10 @@ content_init( intgen_t argc,
 	mwhdrtemplatep = ( media_hdr_t * )dwhdrtemplatep->dh_upper;
 	cwhdrtemplatep = ( content_hdr_t * )mwhdrtemplatep->mh_upper;
 	scwhdrtemplatep = ( content_inode_hdr_t * ) cwhdrtemplatep->ch_specific;
+
+	if ( gwhdrtemplatep->gh_version < GLOBAL_HDR_VERSION_3 ) {
+		sc_use_old_direntpr = BOOL_TRUE;
+	}
 
 	/* process command line args
 	 */
@@ -650,6 +647,9 @@ content_init( intgen_t argc,
 				return BOOL_FALSE;
 			}
 			maxdumpfilesize *= 1024;
+			break;
+		case GETOPT_NOUNCHANGEDDIRS:
+			skip_unchanged_dirs = BOOL_TRUE;
 			break;
 		case GETOPT_EXCLUDEFILES:
 			allowexcludefiles_pr = BOOL_TRUE;
@@ -1443,6 +1443,7 @@ baseuuidbypass:
 			   sc_resumerangep,
 			   subtreep,
 			   subtreecnt,
+			   skip_unchanged_dirs,
 			   sc_startptp,
 			   drivecnt,
 			   &sc_stat_inomapphase,
@@ -1461,14 +1462,13 @@ baseuuidbypass:
 	var_skip( &fsid, inomap_skip );
 
 	/* fill in write header template content info. always produce
-	 * an inomap and dir dump for each media file.
+	 * an inomap for each media file. the dirdump flag will be set
+	 * in content_stream_dump() for streams which dump the directories.
 	 */
 	ASSERT( sizeof( cwhdrtemplatep->ch_specific ) >= sizeof( *scwhdrtemplatep ));
 	scwhdrtemplatep->cih_mediafiletype = CIH_MEDIAFILETYPE_DATA;
 	scwhdrtemplatep->cih_level = ( int32_t )sc_level;
-	scwhdrtemplatep->cih_dumpattr = CIH_DUMPATTR_INOMAP
-					|
-					CIH_DUMPATTR_DIRDUMP;
+	scwhdrtemplatep->cih_dumpattr = CIH_DUMPATTR_INOMAP;
 	if ( subtreecnt ) {
 		scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_SUBTREE;
 	}
@@ -1483,6 +1483,10 @@ baseuuidbypass:
 		scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_INCREMENTAL;
 		scwhdrtemplatep->cih_last_time = sc_incrbasetime;
 		uuid_copy(scwhdrtemplatep->cih_last_id, sc_incrbaseid);
+		if ( skip_unchanged_dirs ) {
+			scwhdrtemplatep->cih_dumpattr |=
+				CIH_DUMPATTR_NOTSELFCONTAINED;
+		}
 	}
 	if ( sc_resumepr ) {
 		scwhdrtemplatep->cih_dumpattr |= CIH_DUMPATTR_RESUME;
@@ -1671,12 +1675,12 @@ baseuuidbypass:
 		sigaddset( &tty_set, SIGINT );
 		sigaddset( &tty_set, SIGQUIT );
 		sigaddset( &tty_set, SIGHUP );
-		sigprocmask( SIG_BLOCK, &tty_set, &orig_set );
+		pthread_sigmask( SIG_BLOCK, &tty_set, &orig_set );
 
 		result = create_inv_session( gwhdrtemplatep, &fsid, mntpnt,
 					     fsdevice, subtreecnt, strmix );
 
-		sigprocmask( SIG_SETMASK, &orig_set, NULL );
+		pthread_sigmask( SIG_SETMASK, &orig_set, NULL );
 
 		if ( !result ) {
 			return BOOL_FALSE;
@@ -1704,22 +1708,6 @@ baseuuidbypass:
 			sc_stat_pds[ driveix ].pds_phase = PDS_NULL;
 		}
 	}
-
-#ifdef SYNCDIR
-	/* allocate a barrier to synchronize directory dumping
-	 */
-	if ( drivecnt > 1 ) {
-		sc_barrierh = qbarrier_alloc( );
-	}
-
-	/* initialize the number of players in the synchronized dir dump.
-	 * they drop out when last media file complete. MUST be modified
-	 * under lock( ).
-	 */
-	sc_thrdsdirdumpsynccnt = drivecnt;
-
-#endif /* SYNCDIR */
-
 
 	return BOOL_TRUE;
 }
@@ -1867,10 +1855,6 @@ content_statline( char **linespp[ ] )
 		case PDS_INOMAP:
 			strcat( statline[ statlinecnt ],
 				"dumping inomap" );
-			break;
-		case PDS_DIRRENDEZVOUS:
-			strcat( statline[ statlinecnt ],
-				"waiting for synchronized directory dump" );
 			break;
 		case PDS_DIRDUMP:
 			sprintf( &statline[ statlinecnt ]
@@ -2148,6 +2132,11 @@ content_stream_dump( ix_t strmix )
 		scwhdrp->cih_endpt.sp_flags = STARTPT_FLAGS_END;
 	}
 
+	// the first stream dumps the directories
+	if ( strmix == 0 ) {
+		scwhdrp->cih_dumpattr |= CIH_DUMPATTR_DIRDUMP;
+	}
+
 	/* fill in inomap fields of write hdr
 	 */
 	inomap_writehdr( scwhdrp );
@@ -2313,39 +2302,41 @@ content_stream_dump( ix_t strmix )
 			return mlog_exit(EXIT_FAULT, rv);
 		}
 
-		/* now dump the directories. use the bigstat iterator
-		 * capability to call my dump_dir function
-		 * for each directory in the bitmap.
+		/* now dump the directories, if this is a stream that dumps
+		 * directories. use the bigstat iterator capability to call
+		 * my dump_dir function for each directory in the bitmap.
 		 */
-		sc_stat_pds[ strmix ].pds_dirdone = 0;
-		rv = dump_dirs( strmix,
-				bstatbufp,
-				bstatbuflen,
-				inomap_contextp );
-		if ( rv == RV_INTR ) {
-			stop_requested = BOOL_TRUE;
-			goto decision_more;
-		}
-		if ( rv == RV_EOM ) {
-			hit_eom = BOOL_TRUE;
-			goto decision_more;
-		}
-		if ( rv == RV_DRIVE ) {
-			free( ( void * )bstatbufp );
-			return mlog_exit(EXIT_NORMAL, rv);
-		}
-		if ( rv == RV_ERROR ) {
-			free( ( void * )bstatbufp );
-			return mlog_exit(EXIT_ERROR, rv);
-		}
-		if ( rv == RV_CORE ) {
-			free( ( void * )bstatbufp );
-			return mlog_exit(EXIT_FAULT, rv);
-		}
-		ASSERT( rv == RV_OK );
-		if ( rv != RV_OK ) {
-			free( ( void * )bstatbufp );
-			return mlog_exit(EXIT_FAULT, rv);
+		if ( scwhdrp->cih_dumpattr & CIH_DUMPATTR_DIRDUMP ) {
+			sc_stat_pds[ strmix ].pds_dirdone = 0;
+			rv = dump_dirs( strmix,
+					bstatbufp,
+					bstatbuflen,
+					inomap_contextp );
+			if ( rv == RV_INTR ) {
+				stop_requested = BOOL_TRUE;
+				goto decision_more;
+			}
+			if ( rv == RV_EOM ) {
+				hit_eom = BOOL_TRUE;
+				goto decision_more;
+			}
+			if ( rv == RV_DRIVE ) {
+				free( ( void * )bstatbufp );
+				return mlog_exit(EXIT_NORMAL, rv);
+			}
+			if ( rv == RV_ERROR ) {
+				free( ( void * )bstatbufp );
+				return mlog_exit(EXIT_ERROR, rv);
+			}
+			if ( rv == RV_CORE ) {
+				free( ( void * )bstatbufp );
+				return mlog_exit(EXIT_FAULT, rv);
+			}
+			ASSERT( rv == RV_OK );
+			if ( rv != RV_OK ) {
+				free( ( void * )bstatbufp );
+				return mlog_exit(EXIT_FAULT, rv);
+			}
 		}
 
 		/* finally, dump the non-directory files beginning with this
@@ -2370,7 +2361,7 @@ content_stream_dump( ix_t strmix )
 					     inomap_next_nondir,
 					     inomap_contextp,
 					     ( intgen_t * )&rv,
-					     ( miniroot || pipeline ) ?
+					     pipeline ?
 					       (bool_t (*)(int))preemptchk : 0,
 					     bstatbufp,
 					     bstatbuflen );
@@ -2518,20 +2509,6 @@ decision_more:
 		 */
 		done = all_nondirs_committed;
 
-#ifdef SYNCDIR
-		/* drop out of the synchronous dump game if done
-		 */
-		if ( done ) {
-			/* REFERENCED */
-			size_t tmpthrdsdirdumpsynccnt;
-			lock( );
-			tmpthrdsdirdumpsynccnt = sc_thrdsdirdumpsynccnt;
-			sc_thrdsdirdumpsynccnt--;
-			unlock( );
-			ASSERT( tmpthrdsdirdumpsynccnt > 0 );
-		}
-#endif /* SYNCDIR */
-
 		/* tell the inventory about the media file
 		 */
 		if ( inv_stmt != INV_TOKEN_NULL ) {
@@ -2618,24 +2595,22 @@ decision_more:
 	 * from all streams have been registered.
 	 */
 	if ( drivep->d_capabilities & DRIVE_CAP_FILES ) {
-		if ( ! miniroot ) {
-			if ( stream_cnt( ) > 1 ) {
-				mlog( MLOG_VERBOSE, _(
-				      "waiting for synchronized "
-				      "session inventory dump\n") );
-				sc_stat_pds[ strmix ].pds_phase = PDS_INVSYNC;
-			}
+		if ( stream_cnt( ) > 1 ) {
+			mlog( MLOG_VERBOSE, _(
+			      "waiting for synchronized "
+			      "session inventory dump\n") );
+			sc_stat_pds[ strmix ].pds_phase = PDS_INVSYNC;
+		}
 
-			/* first be sure all threads have begun
-			 */
-			while ( sc_thrdsarrivedcnt < drivecnt ) {
-				sleep( 1 );
-			}
-			/* now wait for survivors to checkin
-			 */
-			while ( sc_thrdsdonecnt < stream_cnt( )) {
-				sleep( 1 );
-			}
+		/* first be sure all threads have begun
+		*/
+		while ( sc_thrdsarrivedcnt < drivecnt ) {
+			sleep( 1 );
+		}
+		/* now wait for survivors to checkin
+		*/
+		while ( sc_thrdsdonecnt < stream_cnt( )) {
+			sleep( 1 );
 		}
 		/* proceeed
 		 */
@@ -2824,22 +2799,6 @@ dump_dirs( ix_t strmix,
 		__s32 buflenout;
 		intgen_t rval;
 
-#ifdef SYNCDIR
-		/* have all threads rendezvous
-		 */
-		if ( sc_thrdsdirdumpsynccnt > 1 && stream_cnt( ) > 1 ) {
-			rv_t rv;
-			mlog( bulkstatcallcnt == 0 ? MLOG_VERBOSE : MLOG_NITTY,
-			      _("waiting for synchronized directory dump\n") );
-			sc_stat_pds[ strmix ].pds_phase = PDS_DIRRENDEZVOUS;
-			rv = dump_dirs_rendezvous( );
-			if ( rv == RV_INTR ) {
-				return RV_INTR;
-			}
-			ASSERT( rv == RV_OK );
-		}
-#endif /* SYNCDIR */
-
 		if ( bulkstatcallcnt == 0 ) {
 			mlog( MLOG_VERBOSE, _(
 			      "dumping directories\n") );
@@ -2939,58 +2898,6 @@ dump_dirs( ix_t strmix,
 	/* NOTREACHED */
 }
 
-#ifdef SYNCDIR
-static rv_t
-dump_dirs_rendezvous( void )
-{
-	static size_t localsync1;
-	static size_t localsync2;
-
-	sc_thrdswaitingdirdumpsync2 = 0;
-	lock( );
-	sc_thrdswaitingdirdumpsync1++;
-	localsync1 = sc_thrdswaitingdirdumpsync1;
-	localsync2 = sc_thrdswaitingdirdumpsync2;
-	unlock( );
-	while ( localsync2 == 0
-		&&
-		localsync1 < min( stream_cnt( ), sc_thrdsdirdumpsynccnt )) {
-		sleep( 1 );
-		if ( cldmgr_stop_requested( )) {
-			lock( );
-			sc_thrdswaitingdirdumpsync1--;
-			unlock( );
-			return RV_INTR;
-		}
-		lock( );
-		localsync1 = sc_thrdswaitingdirdumpsync1;
-		localsync2 = sc_thrdswaitingdirdumpsync2;
-		unlock( );
-	}
-	lock( );
-	sc_thrdswaitingdirdumpsync1--;
-	sc_thrdswaitingdirdumpsync2++;
-	localsync2 = sc_thrdswaitingdirdumpsync2;
-	unlock( );
-	while ( localsync2 < min( stream_cnt( ), sc_thrdsdirdumpsynccnt )) {
-		sleep( 1 );
-		if ( cldmgr_stop_requested( )) {
-			return RV_INTR;
-		}
-		lock( );
-		localsync2 = sc_thrdswaitingdirdumpsync2;
-		unlock( );
-	}
-	if ( cldmgr_stop_requested( )) {
-		return RV_INTR;
-	}
-	
-	qbarrier( sc_barrierh, min( stream_cnt( ), sc_thrdsdirdumpsynccnt ));
-
-	return RV_OK;
-}
-#endif /* SYNCDIR */
-
 static rv_t
 dump_dir( ix_t strmix,
 	  jdm_fshandle_t *fshandlep,
@@ -3005,7 +2912,7 @@ dump_dir( ix_t strmix,
 	struct dirent *gdp = ( struct dirent *)contextp->cc_getdentsbufp;
 	size_t gdsz = contextp->cc_getdentsbufsz;
 	intgen_t gdcnt;
-	u_int32_t gen;
+	gen_t gen;
 	rv_t rv;
 
 	/* no way this can be non-dir, but check anyway
@@ -3176,8 +3083,7 @@ dump_dir( ix_t strmix,
 			/* lookup the gen number in the ino-to-gen map.
 			 * if it's not there, we have to get it the slow way.
 			 */
-			gen = inomap_get_gen( NULL, p->d_ino );
-			if (gen == GEN_NULL) {
+			if ( inomap_get_gen( NULL, p->d_ino, &gen) ) {
 				xfs_bstat_t statbuf;
 				intgen_t scrval;
 				
@@ -3793,6 +3699,7 @@ dump_file( void *arg1,
 				       cwhdrp->ch_specific;
 	startpt_t *startptp = &scwhdrp->cih_startpt;
 	startpt_t *endptp = &scwhdrp->cih_endpt;
+	bool_t file_skipped = BOOL_FALSE;
 	intgen_t state;
 	rv_t rv;
 
@@ -3938,7 +3845,8 @@ dump_file( void *arg1,
 				    contextp,
 				    scwhdrp,
 				    fshandlep,
-				    statp );
+				    statp,
+				    &file_skipped );
 		if ( statp->bs_ino > contextp->cc_stat_lastino ) {
 			lock( );
 			sc_stat_nondirdone++;
@@ -3986,6 +3894,8 @@ dump_file( void *arg1,
 
 	if ( rv == RV_OK
 	     &&
+	     file_skipped == BOOL_FALSE
+	     &&
 	     sc_dumpextattrpr
 	     &&
 	     ( statp->bs_xflags & XFS_XFLAG_HASATTR )) {
@@ -4006,7 +3916,8 @@ dump_file_reg( drive_t *drivep,
 	       context_t *contextp,
 	       content_inode_hdr_t *scwhdrp,
 	       jdm_fshandle_t *fshandlep,
-	       xfs_bstat_t *statp )
+	       xfs_bstat_t *statp,
+	       bool_t *file_skippedp )
 {
 	startpt_t *startptp = &scwhdrp->cih_startpt;
 	startpt_t *endptp = &scwhdrp->cih_endpt;
@@ -4099,6 +4010,7 @@ dump_file_reg( drive_t *drivep,
 		      statp->bs_ino,
 		      statp->bs_mode,
 		      strerror( errno ));
+		*file_skippedp = BOOL_TRUE;
 		return RV_OK;
 	}
 
@@ -5015,7 +4927,9 @@ copy_xfs_bstat(bstat_t *dst, xfs_bstat_t *src)
 	dst->bs_extsize = src->bs_extsize;
 	dst->bs_extents = src->bs_extents;
 	dst->bs_gen = src->bs_gen;
-	dst->bs_projid = src->bs_projid;
+	dst->bs_projid_lo = src->bs_projid_lo;
+	dst->bs_forkoff = 0;
+	dst->bs_projid_hi = src->bs_projid_hi;
 	dst->bs_dmevmask = src->bs_dmevmask;
 	dst->bs_dmstate = src->bs_dmstate;
 }
@@ -5148,19 +5062,25 @@ dump_dirent( drive_t *drivep,
 	     context_t *contextp,
 	     xfs_bstat_t *statp,
 	     xfs_ino_t ino,
-	     u_int32_t gen,
+	     gen_t gen,
 	     char *name,
 	     size_t namelen )
 {
 	drive_ops_t *dop = drivep->d_opsp;
-	direnthdr_t *dhdrp = ( direnthdr_t * )contextp->cc_mdirentbufp;
-	direnthdr_t *tmpdhdrp;
+	char *outbufp;
 	size_t direntbufsz = contextp->cc_mdirentbufsz;
 	size_t sz;
+	size_t name_offset;
 	intgen_t rval;
 	rv_t rv;
 
-	sz = offsetofmember( direnthdr_t, dh_name )
+	if ( sc_use_old_direntpr ) {
+		name_offset = offsetofmember( direnthdr_v1_t, dh_name );
+	} else {
+		name_offset = offsetofmember( direnthdr_t, dh_name );
+	}
+
+	sz = name_offset
 	     +
 	     namelen
 	     +
@@ -5184,28 +5104,52 @@ dump_dirent( drive_t *drivep,
 	ASSERT( sz <= UINT16MAX );
 	ASSERT( sz >= DIRENTHDR_SZ );
 
-	memset( ( void * )dhdrp, 0, sz );
-	dhdrp->dh_ino = ino;
-	dhdrp->dh_sz = ( u_int16_t )sz;
-	dhdrp->dh_gen = ( u_int16_t )( gen & DENTGENMASK );
+	outbufp = malloc(sz);
 
-	if ( name ) {
-		strcpy( dhdrp->dh_name, name );
+	if ( sc_use_old_direntpr ) {
+		direnthdr_v1_t *dhdrp = ( direnthdr_v1_t * )contextp->cc_mdirentbufp;
+		direnthdr_v1_t *tmpdhdrp = ( direnthdr_v1_t * )outbufp;
+
+		memset( ( void * )dhdrp, 0, sz );
+		dhdrp->dh_ino = ino;
+		dhdrp->dh_sz = ( u_int16_t )sz;
+		dhdrp->dh_gen = ( u_int16_t )( gen & DENTGENMASK );
+		if ( name ) {
+			strcpy( dhdrp->dh_name, name );
+		}
+
+		dhdrp->dh_checksum = calc_checksum( dhdrp, DIRENTHDR_SZ );
+
+		xlate_direnthdr_v1( dhdrp, tmpdhdrp, 1 );
+		if ( name ) {
+			strcpy( tmpdhdrp->dh_name, name );
+		}
+	} else {
+		direnthdr_t *dhdrp = ( direnthdr_t * )contextp->cc_mdirentbufp;
+		direnthdr_t *tmpdhdrp = ( direnthdr_t * )outbufp;
+
+		memset( ( void * )dhdrp, 0, sz );
+		dhdrp->dh_ino = ino;
+		dhdrp->dh_gen = gen;
+		dhdrp->dh_sz = ( u_int16_t )sz;
+		if ( name ) {
+			strcpy( dhdrp->dh_name, name );
+		}
+
+		dhdrp->dh_checksum = calc_checksum( dhdrp, DIRENTHDR_SZ );
+
+		xlate_direnthdr( dhdrp, tmpdhdrp, 1 );
+		if ( name ) {
+			strcpy( tmpdhdrp->dh_name, name );
+		}
 	}
 
-	dhdrp->dh_checksum = calc_checksum( dhdrp, DIRENTHDR_SZ );
-
-	tmpdhdrp = malloc(sz);
-	xlate_direnthdr(dhdrp, tmpdhdrp, 1);
-	if ( name ) {
-		strcpy( tmpdhdrp->dh_name, name );
-	}
-	rval = write_buf( ( char * )tmpdhdrp,
+	rval = write_buf( outbufp,
 			  sz,
 			  ( void * )drivep,
 			  ( gwbfp_t )dop->do_get_write_buf,
 			  ( wfp_t )dop->do_write );
-	free(tmpdhdrp);
+	free(outbufp);
 	switch ( rval ) {
 	case 0:
 		rv = RV_OK;

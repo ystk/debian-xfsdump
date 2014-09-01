@@ -30,7 +30,6 @@ COMMINCL = \
 	ts_mtio.h \
 	types.h \
 	util.h \
-	sproc.h \
 	rec_hdr.h
 
 INVINCL = \
@@ -68,8 +67,7 @@ COMMON = \
 	ring.c \
 	stream.c \
 	timeutil.c \
-	util.c \
-	sproc.c
+	util.c
 
 LOCALS = \
 	content.c \
@@ -89,7 +87,7 @@ HFILES = $(LOCALINCL)
 LHFILES = $(COMMINCL) $(INVINCL)
 LINKS = $(COMMINCL) $(COMMON) $(INVINCL) $(INVCOMMON)
 LDIRT = $(LINKS)
-LLDLIBS = $(LIBUUID) $(LIBHANDLE) $(LIBATTR) $(LIBRMT)
+LLDLIBS = $(LIBUUID) $(LIBHANDLE) $(LIBATTR) $(LIBRMT) $(LIBPTHREAD)
 LTDEPENDENCIES = $(LIBRMT)
 
 LCFLAGS = -DDUMP

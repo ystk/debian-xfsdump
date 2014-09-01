@@ -72,6 +72,7 @@ static intgen_t cb_context( bool_t last,
 			    startpt_t *,
 			    size_t,
 			    intgen_t,
+			    bool_t,
 			    bool_t *);
 static void cb_context_free( void );
 static intgen_t cb_count_inogrp( void *, intgen_t, xfs_inogrp_t *);
@@ -148,6 +149,7 @@ inomap_build( jdm_fshandle_t *fshandlep,
 	      drange_t *resumerangep,
 	      char *subtreebuf[],
 	      ix_t subtreecnt,
+	      bool_t skip_unchanged_dirs,
 	      startpt_t *startptp,
 	      size_t startptcnt,
 	      ix_t *statphasep,
@@ -205,6 +207,7 @@ inomap_build( jdm_fshandle_t *fshandlep,
 			   startptp,
 			   startptcnt,
 			   igrpcnt,
+			   skip_unchanged_dirs,
 			   &pruneneeded );
  	if ( rval ) {
  		free( ( void * )bstatbufp );
@@ -432,6 +435,7 @@ static off64_t cb_target;	/* set by cb_spinit(), used by cb_startpt() */
 static off64_t cb_dircnt;	/* number of dirs CHANGED or PRUNE */
 static off64_t cb_nondircnt;	/* number of non-dirs CHANGED */
 static bool_t *cb_pruneneededp; /* set by cb_context() */
+static bool_t cb_skip_unchanged_dirs;	/* set by cb_context() */
 
 /* cb_context - initializes the call back context for the add and prune
  * phases of inomap_build().
@@ -446,6 +450,7 @@ cb_context( bool_t last,
 	    startpt_t *startptp,
 	    size_t startptcnt,
 	    intgen_t igrpcnt,
+	    bool_t skip_unchanged_dirs,
 	    bool_t *pruneneededp )
 {
 	cb_last = last;
@@ -460,6 +465,7 @@ cb_context( bool_t last,
 	cb_dircnt = 0;
 	cb_nondircnt = 0;
 	cb_pruneneededp = pruneneededp;
+	cb_skip_unchanged_dirs = skip_unchanged_dirs;
 
 	if (inomap_init( igrpcnt ))
 		return -1;
@@ -589,44 +595,6 @@ cb_add( void *arg1,
 					    MAP_NDR_NOCHNG );
 				inomap_exclude_skipattr++;
 				return 0;
-			} else if (allowexcludefiles_pr &&
-					(statp->bs_xflags & XFS_XFLAG_HASATTR)) {
-				int rval;
-				attr_multiop_t attrop;
-				static char *skip_attr_name = "SGI_XFSDUMP_SKIP_FILE";
-				static int deprecated_msg_issued = 0;
-
-				attrop.am_attrname  = skip_attr_name;
-				attrop.am_attrvalue = NULL;
-				attrop.am_length    = 0;
-				attrop.am_error     = 0;
-				attrop.am_flags     = 0;
-				attrop.am_opcode    = ATTR_OP_GET;
-                                
-				rval = jdm_attr_multi( fshandlep,
-						       statp,
-						       (char *)&attrop,
-						       1,
-						       0 );
-				if ( !rval && (!attrop.am_error || attrop.am_error == E2BIG || attrop.am_error == ERANGE) ) {
-					mlog( MLOG_DEBUG | MLOG_EXCLFILES,
-					      "pruned ino %llu, owner %u, estimated size %llu: skip attribute set\n",
-					      statp->bs_ino,
-					      statp->bs_uid,
-					      estimated_size );
-					if ( !deprecated_msg_issued ) {
-						deprecated_msg_issued = 1;
-						mlog( MLOG_SILENT | MLOG_WARNING,
-						      "excluding files using %s attribute is deprecated\n",
-						      skip_attr_name );
-					}
-					inomap_add( cb_inomap_contextp,
-						    ino,
-						    (gen_t)statp->bs_gen,
-						    MAP_NDR_NOCHNG );
-					inomap_exclude_skipattr++;
-					return 0;
-				}
 			}
 
 			inomap_add( cb_inomap_contextp,
@@ -642,12 +610,19 @@ cb_add( void *arg1,
 		ASSERT( changed );
 	} else {
 		if ( mode == S_IFDIR ) {
-			*cb_pruneneededp = BOOL_TRUE;
-			inomap_add( cb_inomap_contextp,
-				    ino,
-				    (gen_t)statp->bs_gen,
-				    MAP_DIR_SUPPRT );
-			cb_dircnt++;
+			if ( cb_skip_unchanged_dirs ) {
+				inomap_add( cb_inomap_contextp,
+					    ino,
+					    (gen_t)statp->bs_gen,
+					    MAP_DIR_NOCHNG );
+			} else {
+				*cb_pruneneededp = BOOL_TRUE;
+				inomap_add( cb_inomap_contextp,
+					    ino,
+					    (gen_t)statp->bs_gen,
+					    MAP_DIR_SUPPRT );
+				cb_dircnt++;
+			}
 		} else {
 			inomap_add( cb_inomap_contextp,
 				    ino,
@@ -965,18 +940,11 @@ cb_startpt( void *arg1,
 /* map context and operators
  */
 
-/* define structure for ino to gen mapping. Allocate 12 bits for the gen
- * instead of the 32-bit gen that XFS uses, as xfsdump currently truncates
- * the gen to 12 bits.
+/* define structure for ino to gen mapping.
  */
-#if DENTGENSZ != 12
-#error DENTGENSZ has changed. i2gseg_t and its users must be updated.
-#endif
-
 struct i2gseg {
 	u_int64_t s_valid;
-	u_char_t s_lower[ INOPERSEG ];
-	u_char_t s_upper[ INOPERSEG / 2 ];
+	gen_t s_gen[ INOPERSEG ];
 };
 typedef struct i2gseg i2gseg_t;
 
@@ -1407,51 +1375,31 @@ inomap_set_gen(void *contextp, xfs_ino_t ino, gen_t gen)
 
 	relino = ino - segp->base;
 	i2gsegp->s_valid |= (u_int64_t)1 << relino;
-	i2gsegp->s_lower[ relino ] = ( u_char_t )( gen & 0xff );
-	if ( relino & 1 ) {
-		/* odd, goes in high nibble */
-		i2gsegp->s_upper[relino / 2] &= ( u_char_t )( 0x0f );
-		i2gsegp->s_upper[relino / 2] |=
-			( u_char_t )( ( gen >> 4 ) & 0xf0 );
-	} else {
-		/* even, goes in low nibble */
-		i2gsegp->s_upper[ relino / 2 ] &= ( u_char_t )( 0xf0 );
-		i2gsegp->s_upper[ relino / 2 ] |=
-			( u_char_t )( ( gen >> 8 ) & 0x0f );
-	}
+	i2gsegp->s_gen[relino] = gen;
 }
 
-gen_t
-inomap_get_gen( void *contextp, xfs_ino_t ino )
+intgen_t
+inomap_get_gen( void *contextp, xfs_ino_t ino, gen_t *gen )
 {
 	seg_addr_t *addrp;
 	seg_addr_t addr;
 	seg_t *segp;
 	i2gseg_t *i2gsegp;
 	xfs_ino_t relino;
-	gen_t gen;
 
 	addrp = contextp ? (seg_addr_t *)contextp : &addr;
 	if ( !inomap_find_seg( addrp, ino ) )
-		return GEN_NULL;
+		return 1;
 
 	segp = inomap_addr2seg( addrp );
 	i2gsegp = &inomap.i2gmap[inomap_addr2segix( addrp )];
 
 	relino = ino - segp->base;
 	if ( ! (i2gsegp->s_valid & ((u_int64_t)1 << relino)) )
-		return GEN_NULL;
+		return 1;
 
-	gen = i2gsegp->s_lower[relino];
-	if (relino & 1) {
-		/* odd, rest of gen in high nibble */
-		gen |= ( (gen_t)i2gsegp->s_upper[relino / 2] & 0xf0 ) << 4;
-	} else {
-		/* even, rest of gen in low nibble */
-		gen |= ( (gen_t)i2gsegp->s_upper[relino / 2] & 0x0f ) << 8;
-	}
-
-	return gen;
+	*gen = i2gsegp->s_gen[relino];
+	return 0;
 }
 
 void

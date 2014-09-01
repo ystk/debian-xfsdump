@@ -123,7 +123,6 @@ ring_create( size_t ringlen,
 	/* kick off the slave thread
 	 */
 	ok = cldmgr_create( ring_slave_entry,
-			    CLONE_VM,
 			    drive_index,
 			    _("slave"),
 			    ringp );
@@ -258,9 +257,7 @@ ring_reset( ring_t *ringp, ring_msg_t *msgp )
 	/* re-initialize the ring
 	 */
 	ASSERT( qsemPavail( ringp->r_ready_qsemh ) == 0 );
-	ASSERT( qsemPblocked( ringp->r_ready_qsemh ) == 0 );
 	ASSERT( qsemPavail( ringp->r_active_qsemh ) == 0 );
-	ASSERT( qsemPblocked( ringp->r_active_qsemh ) <= 1 );
 	ringp->r_ready_in_ix = 0;
 	ringp->r_ready_out_ix = 0;
 	ringp->r_active_in_ix = 0;
@@ -277,9 +274,7 @@ ring_reset( ring_t *ringp, ring_msg_t *msgp )
 		qsemV( ringp->r_ready_qsemh );
 	}
 	ASSERT( qsemPavail( ringp->r_ready_qsemh ) == ringp->r_len );
-	ASSERT( qsemPblocked( ringp->r_ready_qsemh ) == 0 );
 	ASSERT( qsemPavail( ringp->r_active_qsemh ) == 0 );
-	ASSERT( qsemPblocked( ringp->r_active_qsemh ) <= 1 );
 }
 
 void
@@ -421,11 +416,7 @@ ring_slave_entry( void *ringctxp )
 	sigaddset( &blocked_set, SIGTERM );
 	sigaddset( &blocked_set, SIGQUIT );
 	sigaddset( &blocked_set, SIGALRM );
-	sigprocmask( SIG_SETMASK, &blocked_set, NULL );
-
-	/* record slave pid to be used to kill slave
-	 */
-	ringp->r_slavepid = getpid( );
+	pthread_sigmask( SIG_SETMASK, &blocked_set, NULL );
 
 	/* loop reading and precessing messages until told to die
 	 */
@@ -498,5 +489,5 @@ ring_slave_entry( void *ringctxp )
 		ring_slave_put( ringp, msgp );
 	}
 
-	exit( 0 );
+	return 0;
 }

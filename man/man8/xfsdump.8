@@ -66,10 +66,6 @@ option. Other techniques, such as making a second copy of the dump
 image, provide more protection against media failures than multiple
 media files will.
 .P
-However, the current implementation in Linux only supports one destination
-and running single threaded. Therefore, the above comments
-regarding multiple streams describe the possible future capabilities.
-.P
 .I xfsdump
 maintains an online dump inventory in \f2/var/lib/xfsdump/inventory\f1.
 The
@@ -116,10 +112,7 @@ xfsdump cannot fit a media file onto a single tape.
 Allow files to be excluded from the dump.  This will cause xfsdump to 
 skip files which have the "no dump" file attribute set. See the
 "Excluding individual files" section below for details on setting
-this file attribute. Files with an extended attribute named
-"SGI_XFSDUMP_SKIP_FILE" will also be skipped, however this method
-is deprecated and xfsdump will stop checking for it in a future
-version.
+this file attribute.
 .TP 5
 \f3\-f\f1 \f2dest\f1 [ \f3\-f\f1 \f2dest\f1 ... ]
 Specifies a dump destination.
@@ -284,6 +277,23 @@ This option allows incremental
 and resumed dumps to be based on any previous dump,
 rather than just the most recent.
 .TP 5
+.B \-D
+Controls which directories are backed up during an incremental dump. By
+default unchanged directories are dumped if files or directories beneath
+them have changed. This results in a self-contained dump -- if a base dump
+is lost, or you know the file(s) you wish to restore is in an incremental
+dump, you can restore just that dump without loading the base dump(s)
+first. However, this method requires a potentially expensive traversal
+through the filesystem.
+
+When
+.B \-D
+is specified, unchanged directories are not dumped.
+This results in a faster dump, but files will end up in the
+.IR xfsrestore (8)
+.I orphanage
+directory unless the base dump(s) is loaded first.
+.TP 5
 .B \-E
 Pre-erase media.
 If this option is specified, media is erased prior to use.
@@ -322,6 +332,13 @@ Suboptions to filter the inventory display are described later.
 Inhibits the normal update of the inventory.
 This is useful when the media being dumped to
 will be discarded or overwritten.
+.TP 5
+.B \-K
+Generate a format 2 dump instead of the current format. This is useful
+if the dump will be restored on a system with an older
+.I xfsrestore
+which does not understand the current dump format. Use of this option
+is otherwise not recommended.
 .TP 5
 \f3\-L\f1 \f2session_label\f1
 Specifies a label for the dump session.
@@ -374,8 +391,8 @@ Specify I/O buffer ring length.
 uses a ring of output buffers to achieve maximum throughput
 when dumping to tape drives.
 The default ring length is 3.
-However, this is only supported when running multi-threaded
-which has not been done for Linux yet - making this option benign.
+However, this is not currently enabled on
+Linux yet, making this option benign.
 .TP 5
 .B \-
 A lone

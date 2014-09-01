@@ -376,7 +376,9 @@ xlate_bstat(bstat_t *bs1, bstat_t *bs2, int dir)
 	IXLATE(bs1, bs2, bs_extsize);
 	IXLATE(bs1, bs2, bs_extents);
 	IXLATE(bs1, bs2, bs_gen);
-	IXLATE(bs1, bs2, bs_projid);
+	IXLATE(bs1, bs2, bs_projid_lo);
+	IXLATE(bs1, bs2, bs_forkoff);
+	IXLATE(bs1, bs2, bs_projid_hi);
 	IXLATE(bs1, bs2, bs_dmevmask);
 	IXLATE(bs1, bs2, bs_dmstate);
 
@@ -438,8 +440,8 @@ xlate_direnthdr(direnthdr_t *dh1, direnthdr_t *dh2, int dir)
 
 	IXLATE(dh1, dh2, dh_ino);
 	IXLATE(dh1, dh2, dh_gen);
-	IXLATE(dh1, dh2, dh_sz);
 	IXLATE(dh1, dh2, dh_checksum);
+	IXLATE(dh1, dh2, dh_sz);
 
 	if (dir < 0) {
 		ptr1 = dh2;
@@ -450,7 +452,53 @@ xlate_direnthdr(direnthdr_t *dh1, direnthdr_t *dh2, int dir)
 
 	mlog(MLOG_NITTY, "xlate_direnthdr: pre-xlate\n"
 	     "\tdh_ino %llu\n"
-	     "\tdh_gen %d\n"
+	     "\tdh_gen %u\n"
+	     "\tdh_checksum %d\n"
+	     "\tdh_sz %d\n"
+	     "\tdh_name %.8s\n",
+	     ptr1->dh_ino,
+	     ptr1->dh_gen,
+	     ptr1->dh_checksum,
+	     ptr1->dh_sz,
+	     ptr1->dh_name );
+
+	mlog(MLOG_NITTY, "xlate_direnthdr: post-xlate\n"
+	     "\tdh_ino %llu\n"
+	     "\tdh_gen %u\n"
+	     "\tdh_checksum %d\n"
+	     "\tdh_sz %d\n"
+	     "\tdh_name %.8s\n",
+	     ptr2->dh_ino,
+	     ptr2->dh_gen,
+	     ptr2->dh_checksum,
+	     ptr2->dh_sz,
+	     ptr2->dh_name );
+}
+
+/*
+ * xlate_direnthdr_v1 - endian convert struct direnthdr_v1
+ */
+void
+xlate_direnthdr_v1(direnthdr_v1_t *dh1, direnthdr_v1_t *dh2, int dir)
+{
+	direnthdr_v1_t *ptr1 = dh1;
+	direnthdr_v1_t *ptr2 = dh2;
+
+	IXLATE(dh1, dh2, dh_ino);
+	IXLATE(dh1, dh2, dh_gen);
+	IXLATE(dh1, dh2, dh_sz);
+	IXLATE(dh1, dh2, dh_checksum);
+
+	if (dir < 0) {
+		ptr1 = dh2;
+		ptr2 = dh1;
+	}
+
+	BXLATE(dh_name);
+
+	mlog(MLOG_NITTY, "xlate_direnthdr_v1: pre-xlate\n"
+	     "\tdh_ino %llu\n"
+	     "\tdh_gen %u\n"
 	     "\tdh_sz %d\n"
 	     "\tdh_checksum %d\n"
 	     "\tdh_name %.8s\n",
@@ -460,9 +508,9 @@ xlate_direnthdr(direnthdr_t *dh1, direnthdr_t *dh2, int dir)
 	     ptr1->dh_checksum,
 	     ptr1->dh_name );
 
-	mlog(MLOG_NITTY, "xlate_direnthdr: post-xlate\n"
+	mlog(MLOG_NITTY, "xlate_direnthdr_v1: post-xlate\n"
 	     "\tdh_ino %llu\n"
-	     "\tdh_gen %d\n"
+	     "\tdh_gen %u\n"
 	     "\tdh_sz %d\n"
 	     "\tdh_checksum %d\n"
 	     "\tdh_name %.8s\n",

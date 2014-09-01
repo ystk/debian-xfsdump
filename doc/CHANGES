@@ -1,3 +1,50 @@
+xfsdump-3.1.4 (18 July 2014)
+	- fix partial region segfault and debug code (Eric Sandeen)
+	- dump wholly sparse files correctly (Eric Sandeen)
+	- restore capabilities correctly
+	- memory leak fixes (Boris Ranto)
+	- sys_getdents modernisation (Kyle McMartin)
+	- Error message fixes (Iustin Pop)
+	- Updated polish translation (Jakub Bogusz)
+	- debian package build updates (Nathan Scott)
+
+xfsdump-3.1.3 (8 May 2013)
+	- Fix a segfault in xfsrestore when a path name is too long,
+	  thanks to Nigel Tamplin.
+	- Fix a backward compatibility problem.  Dumps created with
+	  version 3.1.2 where extended attributes are in use failed
+	  to restore with v3.1.0 due to file header checksum errors.
+	  Thanks to Fugazzi for reporting.
+	- Refactored release scripts to conform to using git archive.
+	- Changed the build process so that 'make deb' uses the same
+	  process of creating a source tree as the release script.
+
+xfsdump-3.1.2 (13 December 2012)
+	- Update release script to create a source tarball.
+
+xfsdump-3.1.1 (31 October 2012)
+	- Save and restore 32 bit project ids correctly.
+	- German translation, thanks to Chris Leick.
+	- A few fixups to the German translation, thanks to Stefan Ring.
+	- An initial Polish translation, thanks to Jakub Bogusz.
+	- Various build system cleanups, thanks to Mike Frysinger, and
+	  Jan Engelhardt.
+
+xfsdump-3.1.0 (22 March 2012)
+	- Fix metadata restore on split files.
+	- Add a -D option to skip a recursive scan of the filesystem
+	  when dumping.
+	- Fix a 1 byte overflow with empty lists, thanks to Mike Frysinger.
+	- Enable multi-stream support on Linux using pthreads.
+	- Fix handling of Ctrl-D in prompts.
+	- Obsolete SGI_XFSDUMP_SKIP_FILE extended attribute for excluding
+	  files from dump.
+	- Fix restoration of extended attributes on the root directory.
+	- Use the full 32-bit inode generation number instead of 12-bit
+	  generation number.  Bump the dump format version to 3.
+	- Do not create parent directories for orphaned files during
+	  list-only (-t option) restore.
+
 xfsdump-3.0.6 (14 October 2011)
 	- Unconditionally add checksums to various dump headers in
 	  xfsdump.

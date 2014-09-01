@@ -33,6 +33,7 @@
 #include <dirent.h>
 #include <utime.h>
 #include <malloc.h>
+#include <pthread.h>
 
 #include "types.h"
 #include "timeutil.h"
@@ -72,8 +73,10 @@
 #define HOUSEKEEPING_MAGIC	0x686b6d61
 	/* "hkma" - see the housekeeping_magic field of pers_t below.
 	 */
-#define HOUSEKEEPING_VERSION	1
+#define HOUSEKEEPING_VERSION	2
 	/* see the housekeeping_version field of pers_t below.
+	 * version 2 changed the size of a gen_t, which caused node_t
+	 * to change in size. also p_truncategenpr was added to treepers_t.
 	 */
 
 #define WRITE_TRIES_MAX	3
@@ -359,6 +362,15 @@ struct stream_context {
 	char       sc_path[2 * MAXPATHLEN];
 	intgen_t   sc_fd;
 	intgen_t   sc_hsmflags;
+
+	/*
+	 * we have to set the owner before we set extended attributes otherwise
+	 * capabilities will not be restored correctly as setting the owner with
+	 * fchmod will strip the capability attribute from the file. Hence we
+	 * need to do this before restoring xattrs and record it so we don't do
+	 * it again on completion of file restoration.
+	 */
+	bool_t	   sc_ownerset;
 };
 
 typedef struct stream_context stream_context_t;
@@ -625,6 +637,12 @@ struct tran {
 	intgen_t t_persfd;
 		/* file descriptor of the persistent state file
 		 */
+	size64_t t_dirdumps;
+		/* bitset of streams which contain a directory dump
+		 */
+	bool_t t_truncategenpr;
+		/* force use of truncated generation numbers
+		 */
 	sync_t t_sync1;
 		/* to single-thread attempt to validate command line
 		 * selection of dump with online inventory
@@ -656,7 +674,6 @@ typedef struct tran tran_t;
 extern void usage( void );
 extern bool_t preemptchk( void );
 extern char *homedir;
-extern bool_t miniroot;
 extern bool_t pipeline;
 extern bool_t stdoutpiped;
 extern char *sistr;
@@ -760,6 +777,7 @@ static rv_t read_filehdr( drive_t *drivep, filehdr_t *fhdrp, bool_t fhcs );
 static rv_t restore_file( drive_t *drivep,
 			  filehdr_t *fhdrp,
 			  bool_t ehcs,
+			  bool_t ahcs,
 			  char *path1,
 			  char *path2 );
 static bool_t restore_reg( drive_t *drivep,
@@ -1162,6 +1180,9 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 		case GETOPT_ROOTPERM:
 			restore_rootdir_permissions = BOOL_TRUE;
 			break;
+		case GETOPT_FMT2COMPAT:
+			tranp->t_truncategenpr = BOOL_TRUE;
+			break;
 		}
 	}
 
@@ -1183,6 +1204,12 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 		usage( );
 		return BOOL_FALSE;
 	}
+
+	/* assume all streams contain a directory dump. streams will remove
+	 * themselves from this bitset if they do not contain a directory dump.
+	 */
+	ASSERT( drivecnt <= sizeof(tranp->t_dirdumps) * NBBY );
+	tranp->t_dirdumps = ( 1ULL << drivecnt ) - 1;
 
 	/* the user may specify stdin as the restore source stream,
 	 * by a single dash ('-') with no option letter. This must
@@ -1464,6 +1491,13 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			      GETOPT_NOSUBTREE );
 			return BOOL_FALSE;
 		}
+		if ( tranp->t_truncategenpr ) {
+			mlog( MLOG_NORMAL | MLOG_ERROR, _(
+			      "-%c valid only when initiating "
+			      "cumulative restore\n"),
+			      GETOPT_FMT2COMPAT );
+			return BOOL_FALSE;
+		}
 	} else {
 		if ( ! resumepr && ! sesscpltpr ) {
 			mlog( MLOG_NORMAL | MLOG_ERROR, _(
@@ -1523,6 +1557,12 @@ content_init( intgen_t argc, char *argv[ ], size64_t vmsz )
 			     "-%c and -%c valid only when initiating restore\n"),
 			      GETOPT_SUBTREE,
 			      GETOPT_NOSUBTREE );
+			return BOOL_FALSE;
+		}
+		if ( tranp->t_truncategenpr ) {
+			mlog( MLOG_NORMAL | MLOG_ERROR, _(
+			      "-%c valid only when initiating restore\n"),
+			      GETOPT_FMT2COMPAT );
 			return BOOL_FALSE;
 		}
 	}
@@ -2218,7 +2258,7 @@ content_stream_restore( ix_t thrdix )
 #if DEBUG_DUMPSTREAMS
 			{
 			    static int count[STREAM_MAX] = {0};
-			    intgen_t streamix = stream_getix( getpid() );
+			    intgen_t streamix = stream_getix( pthread_self() );
 			    if (++(count[streamix]) == 30) {
 				mlog( MLOG_TRACE,
 					"still waiting for dirs to be restored\n");
@@ -2235,6 +2275,30 @@ content_stream_restore( ix_t thrdix )
 		}
 		if ( tranp->t_sync3 == SYNC_DONE ) {
 			unlock( );
+			continue;
+		}
+		if ( !(scrhdrp->cih_dumpattr & CIH_DUMPATTR_DIRDUMP) ) {
+			/* if no streams have a directory dump, issue a
+			 * message and exit. first set SYNC_BUSY to prevent
+			 * other threads from coming through here and issuing
+			 * the same message.
+			 */
+			tranp->t_dirdumps &= ~(1ULL << thrdix);
+			if ( !tranp->t_dirdumps ) {
+				tranp->t_sync3 = SYNC_BUSY;
+			}
+			unlock( );
+			if ( !tranp->t_dirdumps ) {
+				mlog( MLOG_VERBOSE | MLOG_ERROR, _(
+					"no directory dump found\n") );
+				Media_end( Mediap );
+				return mlog_exit(EXIT_NORMAL, RV_ERROR);
+			}
+			sleep( 1 );
+			if ( cldmgr_stop_requested( )) {
+				Media_end( Mediap );
+				return mlog_exit(EXIT_NORMAL, RV_INTR);
+			}
 			continue;
 		}
 		tranp->t_sync3 = SYNC_BUSY;
@@ -2295,12 +2359,21 @@ content_stream_restore( ix_t thrdix )
 					tranp->t_vmsz,
 					fullpr,
 					persp->a.restoredmpr,
-					persp->a.dstdirisxfspr );
+					persp->a.dstdirisxfspr,
+					grhdrp->gh_version,
+					tranp->t_truncategenpr );
 			if ( ! ok ) {
 				Media_end( Mediap );
 				return mlog_exit(EXIT_ERROR, RV_ERROR);
 			}
 			tranp->t_treeinitdonepr = BOOL_TRUE;
+
+		} else {
+			ok = tree_check_dump_format( grhdrp->gh_version );
+			if ( ! ok ) {
+				Media_end( Mediap );
+				return mlog_exit(EXIT_ERROR, RV_ERROR);
+			}
 		}
 
 		/* commit the session and accumulative state
@@ -2357,7 +2430,7 @@ content_stream_restore( ix_t thrdix )
 #if DEBUG_DUMPSTREAMS
 			{
 			static int count[STREAM_MAX] = {0};
-			intgen_t streamix = stream_getix( getpid() );
+			intgen_t streamix = stream_getix( pthread_self() );
 			    if (++(count[streamix]) == 30) {
 				mlog( MLOG_NORMAL,
 				      "still waiting for dirs post-processing\n");
@@ -2499,12 +2572,6 @@ content_stream_restore( ix_t thrdix )
 		}
 	}
 
-	/* out of media files, so finish the last file that
-	 * was being worked on.
-	 */
-	if ((strctxp->sc_bstat.bs_mode & S_IFMT) == S_IFREG)
-		restore_complete_reg(strctxp);
-
 	/* finally, choose one thread to do final processing
 	 * and cleanup. the winner waits, the losers all exit.
 	 * once the losers exit, the winner can perform cleanup.
@@ -2516,14 +2583,12 @@ content_stream_restore( ix_t thrdix )
 	}
 	tranp->t_sync5 = SYNC_BUSY;
 	unlock( );
-	if ( ! miniroot ) {
-		if ( drivecnt > 1 ) {
-			mlog( MLOG_TRACE,
-			      "waiting for other streams to exit\n" );
-		}
-		while ( cldmgr_otherstreamsremain( thrdix )) {
-			sleep( 1 );
-		}
+	if ( drivecnt > 1 ) {
+		mlog( MLOG_TRACE,
+		      "waiting for other streams to exit\n" );
+	}
+	while ( cldmgr_otherstreamsremain( thrdix )) {
+		sleep( 1 );
 	}
 
 	mlog( MLOG_DEBUG,
@@ -2912,6 +2977,13 @@ applydirdump( drive_t *drivep,
 		persp->s.marknorefdonepr = BOOL_TRUE;
 	}
 
+	if ( scrhdrp->cih_dumpattr & CIH_DUMPATTR_NOTSELFCONTAINED ) {
+		mlog( MLOG_NORMAL | MLOG_NOTE, _(
+		      "dump is not self-contained, "
+		      "orphaned files expected if base dump(s) "
+		      "was not applied\n") );
+	}
+
 	if ( ! persp->s.dirdonepr ) {
 		rv_t rv;
 		dah_t dah;
@@ -2971,10 +3043,10 @@ applydirdump( drive_t *drivep,
 				return RV_INTR;
 			}
 
-			/* if miniroot or pipeline , call preemptchk( ) to
+			/* if in a pipeline , call preemptchk( ) to
 			 * print status reports
 			 */
-			if ( miniroot || pipeline )
+			if ( pipeline )
 			{
 				mlog( MLOG_DEBUG ,
 					"preemptchk( )\n");
@@ -3039,7 +3111,7 @@ applydirdump( drive_t *drivep,
 				 */
 				rv = tree_addent( dirh,
 					     dhdrp->dh_ino,
-					     ( size_t )dhdrp->dh_gen,
+					     dhdrp->dh_gen,
 					     dhdrp->dh_name,
 					     namelen );
 				if ( rv != RV_OK ) {
@@ -3330,6 +3402,7 @@ applynondirdump( drive_t *drivep,
 		 char *path2,
 		 filehdr_t *fhdrp )
 {
+	rv_t rv = RV_UNKNOWN;
 	bool_t fhcs;
 	bool_t ehcs;
 	bool_t ahcs;
@@ -3360,18 +3433,26 @@ applynondirdump( drive_t *drivep,
 	 */
 	pi_bracketneededegrps( fileh, &first_egrp, &next_egrp );
 
+	/* initialize the stream context
+	 */
+	memset(&strctxp->sc_bstat, 0, sizeof(bstat_t));
+	strctxp->sc_path[0] = '\0';
+	strctxp->sc_fd = -1;
+	strctxp->sc_ownerset = BOOL_FALSE;
+
+
 	for ( ; ; ) {
 		drive_ops_t *dop = drivep->d_opsp;
 		drive_mark_t drivemark;
 		bstat_t *bstatp = &fhdrp->fh_stat;
 		bool_t resyncpr = BOOL_FALSE;
-		rv_t rv;
 		intgen_t rval;
 
 		/* if a null file header, break
 		 */
 		if ( fhdrp->fh_flags & FILEHDR_FLAGS_NULL ) {
-			break;
+			rv = RV_OK;
+			goto applynondirdump_out;
 		}
 
 		/* if working on a different file than we were previously,
@@ -3379,15 +3460,15 @@ applynondirdump( drive_t *drivep,
 		 */
 		if ( bstatp->bs_ino != strctxp->sc_bstat.bs_ino ) {
 
-			if ((strctxp->sc_bstat.bs_mode & S_IFMT) == S_IFREG)
-				restore_complete_reg(strctxp);
+			restore_complete_reg(strctxp);
 
 			/* start new ino */
 			memcpy(&strctxp->sc_bstat, bstatp, sizeof(bstat_t));
 			strctxp->sc_path[0] = '\0';
 			strctxp->sc_fd = -1;
+			strctxp->sc_ownerset = BOOL_FALSE;
 
-			rv = restore_file( drivep, fhdrp, ehcs, path1, path2 );
+			rv = restore_file( drivep, fhdrp, ehcs, ahcs, path1, path2 );
 
 		} else if ( fhdrp->fh_flags & FILEHDR_FLAGS_EXTATTR ) {
 			rv = restore_extattr( drivep,
@@ -3411,7 +3492,8 @@ applynondirdump( drive_t *drivep,
 		case RV_OK:
 			break;
 		case RV_EOD:
-			return RV_OK;
+			rv = RV_OK;
+			goto applynondirdump_out;
 		case RV_CORRUPT:
 			rval = ( * dop->do_next_mark )( drivep );
 			if ( rval ) {
@@ -3419,12 +3501,13 @@ applynondirdump( drive_t *drivep,
 				      "unable to resync media file: "
 				      "some portion of dump will NOT "
 				      "be restored\n") );
-				return RV_OK;  /* treat as EOD */
+				rv = RV_OK;  /* treat as EOD */
+				goto applynondirdump_out;
 			}
 			resyncpr = BOOL_TRUE;
 			break;
 		default:
-			return rv;
+			goto applynondirdump_out;
 		}
 
 		/* update stats if appropriate
@@ -3464,7 +3547,8 @@ applynondirdump( drive_t *drivep,
 			case RV_OK:
 				break;
 			case RV_EOD:
-				return RV_OK;
+				rv = RV_OK;
+				goto applynondirdump_out;
 			case RV_CORRUPT:
 				rval = ( * dop->do_next_mark )( drivep );
 				if ( rval ) {
@@ -3472,11 +3556,12 @@ applynondirdump( drive_t *drivep,
 					      "unable to resync media file: "
 					      "some portion of dump will NOT "
 					      "be restored\n") );
-					return RV_OK;  /* treat as EOD */
+					rv = RV_OK;  /* treat as EOD */
+					goto applynondirdump_out;
 				}
 				resyncpr = BOOL_TRUE;
 			default:
-				return rv;
+				goto applynondirdump_out;
 			}
 
 			if ( resyncpr && rv == RV_OK ) {
@@ -3498,17 +3583,26 @@ applynondirdump( drive_t *drivep,
 				       fhdrp->fh_offset );
 		}
 
-		/* if miniroot or pipeline , call preemptchk( ) to
+		/* if in a pipeline , call preemptchk( ) to
 		 * print status reports
 		 */
-		if ( miniroot || pipeline )
+		if ( pipeline )
 		{
 			mlog( MLOG_DEBUG ,
 				"preemptchk( )\n");
 			preemptchk( );
 		}
 	}
-	return RV_OK;
+
+applynondirdump_out:
+
+	/* We've hit the end of this media file or encountered corruption.
+	 * In either case, we may not be back to complete the metadata for
+	 * this file, so attempt to complete it now.
+	 */
+	restore_complete_reg(strctxp);
+
+	return rv;
 }
 
 /* ARGSUSED */
@@ -7102,6 +7196,7 @@ struct cb_context {
 	filehdr_t *cb_fhdrp;
 	rv_t cb_rv;
 	bool_t cb_ehcs;
+	bool_t cb_ahcs;
 	char *cb_path1;
 	char *cb_path2;
 };
@@ -7114,6 +7209,7 @@ static rv_t
 restore_file( drive_t *drivep,
 	      filehdr_t *fhdrp,
 	      bool_t ehcs,
+	      bool_t ahcs,
 	      char *path1,
 	      char *path2 )
 {
@@ -7129,6 +7225,7 @@ restore_file( drive_t *drivep,
 	context.cb_fhdrp = fhdrp;
 	context.cb_rv = RV_OK;
 	context.cb_ehcs = ehcs;
+	context.cb_ahcs = ahcs;
 	context.cb_path1 = path1;
 	context.cb_path2 = path2;
 	rv = tree_cb_links( bstatp->bs_ino,
@@ -7161,6 +7258,7 @@ restore_file_cb( void *cp, bool_t linkpr, char *path1, char *path2 )
 	bstat_t *bstatp = &fhdrp->fh_stat;
 	rv_t *rvp = &contextp->cb_rv;
 	bool_t ehcs = contextp->cb_ehcs;
+	bool_t ahcs = contextp->cb_ahcs;
 	stream_context_t *strctxp = (stream_context_t *)drivep->d_strmcontextp;
 
 	int rval;
@@ -7186,12 +7284,22 @@ restore_file_cb( void *cp, bool_t linkpr, char *path1, char *path2 )
 			ok = restore_reg( drivep, fhdrp, rvp, path1 );
 			if (!ok)
 				return ok;
-			ok = restore_extent_group( drivep,
-						   fhdrp,
-						   path1,
-						   strctxp->sc_fd,
-						   ehcs,
-						   rvp );
+			if ( fhdrp->fh_flags & FILEHDR_FLAGS_EXTATTR ) {
+				*rvp = restore_extattr( drivep,
+							fhdrp,
+							path1,
+							ahcs,
+							BOOL_FALSE, /* isdirpr */
+							BOOL_FALSE, /* onlydoreadpr */
+							DAH_NULL );
+			} else {
+				ok = restore_extent_group( drivep,
+							   fhdrp,
+							   path1,
+							   strctxp->sc_fd,
+							   ehcs,
+							   rvp );
+			}
 			return ok;
 		case S_IFBLK:
 		case S_IFCHR:
@@ -7253,6 +7361,61 @@ restore_file_cb( void *cp, bool_t linkpr, char *path1, char *path2 )
 		      path2 );
 		return BOOL_TRUE;
 	}
+}
+
+/*
+ * Set the file owner and strip suid/sgid if necessary. On failure, it will
+ * close the file descriptor, unlink the file and return -1. On success,
+ * it will mark the stream contexts as having set the owner and return 0.
+ */
+static int
+set_file_owner(
+	char		 *path,
+	intgen_t	 *fdp,
+	stream_context_t *strcxtp)
+{
+	bstat_t		*bstatp = &strcxtp->sc_bstat;
+	mode_t		mode = (mode_t)bstatp->bs_mode;
+	int		rval;
+
+	rval = fchown(*fdp, (uid_t)bstatp->bs_uid, (gid_t)bstatp->bs_gid );
+	if (!rval)
+		goto done;
+
+	mlog(MLOG_VERBOSE | MLOG_WARNING,
+	     _("chown (uid=%u, gid=%u) %s failed: %s\n"),
+	     bstatp->bs_uid, bstatp->bs_gid, path, strerror(errno));
+
+	if (mode & S_ISUID) {
+		mlog(MLOG_VERBOSE | MLOG_WARNING,
+		     _("stripping setuid bit on %s since chown failed\n"),
+		     path);
+		mode &= ~S_ISUID;
+	}
+
+	if ((mode & (S_ISGID|S_IXGRP)) == (S_ISGID|S_IXGRP)) {
+		mlog(MLOG_VERBOSE | MLOG_WARNING,
+		     _("stripping setgid bit on %s since chown failed\n"),
+		     path);
+		mode &= ~S_ISGID;
+	}
+
+	if (mode == (mode_t)bstatp->bs_mode)
+		goto done;
+
+	rval = fchmod(*fdp, mode);
+	if (rval) {
+		mlog(MLOG_VERBOSE | MLOG_ERROR,
+		     _("unable to strip setuid/setgid on %s, unlinking file.\n"),
+		     path);
+		unlink(path);
+		close(*fdp);
+		*fdp = -1;
+		return -1;
+	}
+done:
+	strcxtp->sc_ownerset = BOOL_TRUE;
+	return 0;
 }
 
 /* called to begin a regular file. if no path given, or if just toc,
@@ -7346,6 +7509,12 @@ restore_reg( drive_t *drivep,
 		}
 	}
 
+	if (strctxp->sc_ownerset == BOOL_FALSE && persp->a.ownerpr) {
+		rval = set_file_owner(path, fdp, strctxp);
+		if (rval)
+			return BOOL_TRUE;
+	}
+
 	if ( persp->a.dstdirisxfspr ) {
 
 		/* set the extended inode flags, except those which must
@@ -7355,7 +7524,7 @@ restore_reg( drive_t *drivep,
 		memset((void *)&fsxattr, 0, sizeof( fsxattr ));
 		fsxattr.fsx_xflags = bstatp->bs_xflags & ~POST_DATA_XFLAGS;
 		fsxattr.fsx_extsize = (u_int32_t) bstatp->bs_extsize;
-		fsxattr.fsx_projid = bstatp->bs_projid;
+		fsxattr.fsx_projid = bstat_projid(bstatp);
 
 		rval = ioctl( *fdp, XFS_IOC_FSSETXATTR, (void *)&fsxattr);
 		if ( rval < 0 ) {
@@ -7420,6 +7589,11 @@ restore_extent_group( drive_t *drivep,
 		 * we are done.
 		 */
 		if ( ehdr.eh_type == EXTENTHDR_TYPE_LAST ) {
+			/* For a wholly sparse file, there is no HOLE
+			 * record; advance restoredsz to EOF.
+			 */
+			if (!restoredsz)
+				restoredsz = bstatp->bs_size;
 			break;
 		}
 
@@ -7500,6 +7674,9 @@ restore_complete_reg(stream_context_t *strcxtp)
 	struct utimbuf utimbuf;
 	intgen_t rval;
 
+	// only applies to regular files
+	if (!S_ISREG((strcxtp->sc_bstat.bs_mode)))
+		return BOOL_TRUE;
 
 	if (fd < 0)
 		return BOOL_TRUE;
@@ -7524,45 +7701,10 @@ restore_complete_reg(stream_context_t *strcxtp)
 
 	/* set the owner and group (if enabled)
 	 */
-	if ( persp->a.ownerpr ) {
-		rval = fchown( fd,
-			       ( uid_t )bstatp->bs_uid,
-			       ( gid_t )bstatp->bs_gid );
-		if ( rval ) {
-			mode_t mode = (mode_t)bstatp->bs_mode;
-
-			mlog( MLOG_VERBOSE | MLOG_WARNING,
-			      _("chown (uid=%u, gid=%u) %s failed: %s\n"),
-			      bstatp->bs_uid,
-			      bstatp->bs_gid,
-			      path,
-			      strerror( errno ));
-
-			if ( mode & S_ISUID ) {
-				mlog( MLOG_VERBOSE | MLOG_WARNING,
-				      _("stripping setuid bit on %s "
-				      "since chown failed\n"),
-				      path );
-				mode &= ~S_ISUID;
-			}
-			if ( (mode & (S_ISGID|S_IXGRP)) == (S_ISGID|S_IXGRP) ) {
-				mlog( MLOG_VERBOSE | MLOG_WARNING,
-				      _("stripping setgid bit on %s "
-				      "since chown failed\n"),
-				      path );
-				mode &= ~S_ISGID;
-			}
-			if ( mode != (mode_t)bstatp->bs_mode ) {
-				rval = fchmod( fd, mode );
-				if ( rval ) {
-					mlog( MLOG_VERBOSE | MLOG_ERROR,
-					      _("unable to strip setuid/setgid "
-					      "on %s, unlinking file.\n"),
-					      path );
-					unlink( path );
-				}
-			}
-		}
+	if (strcxtp->sc_ownerset == BOOL_FALSE && persp->a.ownerpr) {
+		rval = set_file_owner(path, &fd, strcxtp);
+		if (rval)
+			return BOOL_TRUE;
 	}
 
 	/* set the permissions/mode
@@ -7603,7 +7745,7 @@ restore_complete_reg(stream_context_t *strcxtp)
 		memset((void *)&fsxattr, 0, sizeof( fsxattr ));
 		fsxattr.fsx_xflags = bstatp->bs_xflags;
 		fsxattr.fsx_extsize = (u_int32_t)bstatp->bs_extsize;
-		fsxattr.fsx_projid = bstatp->bs_projid;
+		fsxattr.fsx_projid = bstat_projid(bstatp);
 
 		rval = ioctl( fd, XFS_IOC_FSSETXATTR, (void *)&fsxattr );
 		if ( rval < 0 ) {
@@ -7697,7 +7839,7 @@ restore_spec( filehdr_t *fhdrp, rv_t *rvp, char *path )
 			if ( strlen( path ) >= sizeof( addr.sun_path )) {
 				mlog( MLOG_VERBOSE | MLOG_WARNING, _(
 				      "pathname too long for bind of "
-				      "%s ino %llu %s: %s: discarding\n"),
+				      "%s ino %llu %s: discarding\n"),
 				      printstr,
 				      fhdrp->fh_stat.bs_ino,
 				      path );
@@ -8055,23 +8197,26 @@ read_dirent( drive_t *drivep,
 	     size_t direntbufsz,
 	     bool_t dhcs )
 {
+	global_hdr_t *grhdrp = drivep->d_greadhdrp;
 	drive_ops_t *dop = drivep->d_opsp;
 	/* REFERENCED */
 	intgen_t nread;
 	intgen_t rval;
 	direnthdr_t tmpdh;
+	char *namep;    // beginning of name following the direnthdr_t
+
+	ASSERT( sizeof( direnthdr_t ) == DIRENTHDR_SZ );
+	ASSERT( sizeof( direnthdr_v1_t ) == DIRENTHDR_SZ );
 
 	/* read the head of the dirent
 	 */
 	nread = read_buf( ( char * )&tmpdh,
-			  sizeof( direnthdr_t ),
+			  DIRENTHDR_SZ,
 			  ( void * )drivep,
 			  ( rfp_t )dop->do_read,
 			  ( rrbfp_t )
 			  dop->do_return_read_buf,
 			  &rval );
-	xlate_direnthdr(&tmpdh, dhdrp, 1);
-
 	switch( rval ) {
 	case 0:
 		break;
@@ -8088,7 +8233,33 @@ read_dirent( drive_t *drivep,
 	default:
 		return RV_CORE;
 	}
-	ASSERT( ( size_t )nread == sizeof( direnthdr_t ));
+	ASSERT( ( size_t )nread == DIRENTHDR_SZ );
+
+	if ( grhdrp->gh_version >= GLOBAL_HDR_VERSION_3 ) {
+		xlate_direnthdr(&tmpdh, dhdrp, 1);
+		namep = dhdrp->dh_name + sizeof(dhdrp->dh_name);
+
+		if ( dhcs && !is_checksum_valid( dhdrp, DIRENTHDR_SZ )) {
+			mlog( MLOG_NORMAL | MLOG_WARNING, _(
+				"bad directory entry header checksum\n") );
+			return RV_CORRUPT;
+		}
+	} else {
+		direnthdr_v1_t dhdr_v1;
+		xlate_direnthdr_v1((direnthdr_v1_t *)&tmpdh, &dhdr_v1, 1);
+		dhdrp->dh_ino = dhdr_v1.dh_ino;
+		dhdrp->dh_gen = BIGGEN2GEN(dhdr_v1.dh_gen);
+		dhdrp->dh_checksum = dhdr_v1.dh_checksum;
+		dhdrp->dh_sz = dhdr_v1.dh_sz;
+		memcpy(dhdrp->dh_name, dhdr_v1.dh_name, sizeof(dhdr_v1.dh_name));
+		namep = dhdrp->dh_name + sizeof(dhdr_v1.dh_name);
+
+		if ( dhcs && !is_checksum_valid( &dhdr_v1, DIRENTHDR_SZ )) {
+			mlog( MLOG_NORMAL | MLOG_WARNING, _(
+				"bad directory entry header checksum\n") );
+			return RV_CORRUPT;
+		}
+	}
 
 	mlog( MLOG_NITTY,
 	      "read dirent hdr ino %llu gen %u size %u\n",
@@ -8096,17 +8267,10 @@ read_dirent( drive_t *drivep,
 	      ( size_t )dhdrp->dh_gen,
 	      ( size_t )dhdrp->dh_sz );
 
-	if ( dhcs ) {
-		if ( dhdrp->dh_sz == 0 ) {
-			mlog( MLOG_NORMAL | MLOG_WARNING, _(
-			      "corrupt directory entry header\n") );
-			return RV_CORRUPT;
-		}
-		if ( !is_checksum_valid( dhdrp, DIRENTHDR_SZ )) {
-			mlog( MLOG_NORMAL | MLOG_WARNING, _(
-			      "bad directory entry header checksum\n") );
-			return RV_CORRUPT;
-		}
+	if ( dhdrp->dh_sz == 0 ) {
+		mlog( MLOG_NORMAL | MLOG_WARNING, _(
+			"corrupt directory entry header\n") );
+		return RV_CORRUPT;
 	}
 
 	/* if null, return
@@ -8123,7 +8287,7 @@ read_dirent( drive_t *drivep,
 	ASSERT( ! ( ( size_t )dhdrp->dh_sz & ( DIRENTHDR_ALIGN - 1 )));
 	if ( ( size_t )dhdrp->dh_sz > sizeof( direnthdr_t )) {
 		size_t remsz = ( size_t )dhdrp->dh_sz - sizeof( direnthdr_t );
-		nread = read_buf( ( char * )( dhdrp + 1 ),
+		nread = read_buf( namep,
 				  remsz,
 				  ( void * )drivep,
 				  ( rfp_t )dop->do_read,
@@ -8736,22 +8900,23 @@ dump_partials(void)
 	int i;
 
 	pi_lock();
-	printf("\npartial_reg: count=%d\n", persp->a.parrestcnt);
+	printf("\npartial_reg: count=%d\n", (int)persp->a.parrestcnt);
 	if (persp->a.parrestcnt > 0) {
 		for (i=0; i < partialmax; i++ ) {
 			if (persp->a.parrest[i].is_ino > 0) {
 				int j;
 
 				isptr = &persp->a.parrest[i];
-				printf( "\tino=%lld ", isptr->is_ino);
+				printf("\tino=%llu ",
+				       (unsigned long long)isptr->is_ino);
 				for (j=0, bsptr=isptr->is_bs;
 				     j < drivecnt; 
 				     j++, bsptr++)
 				{
 					if (bsptr->endoffset > 0) {
 						printf("%d:%lld-%lld ",
-						     j, bsptr->offset, 
-						     bsptr->endoffset);
+						   j, (long long)bsptr->offset,
+						   (long long)bsptr->endoffset);
 					} 
 				}
 				printf( "\n");
@@ -8771,13 +8936,17 @@ dump_partials(void)
 void
 check_valid_partials(void)
 {
-        int num_partials[STREAM_MAX]; /* sum of partials for a given drive */
+	int *num_partials; /* array for sum of partials for a given drive */
 	partial_rest_t *isptr = NULL;
 	bytespan_t *bsptr = NULL;
 	int i;
 
 	/* zero the sums for each stream */
-        memset(num_partials, 0, sizeof(num_partials));
+	num_partials = calloc(drivecnt, sizeof(int));
+	if (!num_partials) {
+		perror("num_partials array allocation");
+		return;
+	}
 
 	pi_lock();
 	if (persp->a.parrestcnt > 0) {
@@ -8805,6 +8974,7 @@ check_valid_partials(void)
 		}
 	}
 	pi_unlock();
+	free(num_partials);
 }
 #endif
 
@@ -8855,7 +9025,8 @@ partial_reg( ix_t d_index,
 
 	/* If not found, find a free one, fill it in and return */
 	if ( ! isptr ) {
-		mlog(MLOG_NITTY, "partial_reg: no entry found for %llu\n", ino);
+		mlog(MLOG_NITTY | MLOG_NOLOCK,
+			"partial_reg: no entry found for %llu\n", ino);
 		/* find a free one */
 		for (i=0; i < partialmax; i++ ) {
 			if (persp->a.parrest[i].is_ino == 0) {
@@ -8885,6 +9056,7 @@ partial_reg( ix_t d_index,
 #ifdef DEBUGPARTIALS
 		dump_partials();
 #endif
+		return;
 	}
 
 found:
@@ -8894,8 +9066,10 @@ found:
 		/* no existing entry for this drive, fill in the values */
 		bsptr->offset = offset;
 		bsptr->endoffset = endoffset;
-		mlog(MLOG_NITTY, "partial_reg: update entry [%d]: "
-		     "<off = %lld, end = %lld>\n", d_index, offset, endoffset);
+		mlog(MLOG_NITTY | MLOG_NOLOCK,
+			"partial_reg: update entry [%d]: "
+			"<off = %lld, end = %lld>\n",
+			d_index, offset, endoffset);
 	} else {
 		bool_t ret;
 
@@ -8904,9 +9078,11 @@ found:
 		 */
 		bsptr->endoffset = endoffset;
 		ret = partial_check2(isptr, fsize);
-		mlog(MLOG_NITTY, "partial_reg: extend entry [%d]: "
-		     "<end = %lld>\n", d_index, endoffset);
-		mlog(MLOG_NITTY, "partial_reg: partial_check returns: %d\n", ret);
+		mlog(MLOG_NITTY | MLOG_NOLOCK,
+			"partial_reg: extend entry [%d]: <end = %lld>\n",
+			d_index, endoffset);
+		mlog(MLOG_NITTY | MLOG_NOLOCK,
+			"partial_reg: partial_check returns: %d\n", ret);
 	}
 
 	pi_unlock();

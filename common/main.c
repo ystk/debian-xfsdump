@@ -32,6 +32,7 @@
 #include <getopt.h>
 #include <stdint.h>
 #include <sched.h>
+#include <pthread.h>
 
 #include "exit.h"
 #include "types.h"
@@ -86,10 +87,6 @@ bool_t preemptchk( int );
 static bool_t loadoptfile( int *argcp, char ***argvp );
 static char * stripquotes( char *p );
 static void shiftleftby1( char *p, char *endp );
-static bool_t in_miniroot_heuristic( void );
-#ifdef HIDDEN
-static void mrh_sighandler( int );
-#endif
 static void sighandler( int );
 static int childmain( void * );
 static bool_t sigint_dialog( void );
@@ -106,18 +103,11 @@ static char *strpbrkquotes( char *p, const char *sep );
 
 /* definition of locally defined global variables ****************************/
 
-intgen_t version = 3;
-intgen_t subversion = 0;
 char *progname = 0;			/* used in all error output */
 char *homedir = 0;			/* directory invoked from */
-#ifdef HIDDEN
-bool_t miniroot = BOOL_FALSE;
-#else
-bool_t miniroot = BOOL_TRUE;
-#endif /* HIDDEN */
 bool_t pipeline = BOOL_FALSE;
 bool_t stdoutpiped = BOOL_FALSE;
-pid_t parentpid;
+pthread_t parenttid;
 char *sistr;
 size_t pgsz;
 size_t pgmask;
@@ -136,10 +126,6 @@ static bool_t sighup_received;
 static bool_t sigterm_received;
 static bool_t sigquit_received;
 static bool_t sigint_received;
-static size_t prbcld_cnt;
-static pid_t prbcld_pid;
-static intgen_t prbcld_xc;
-static intgen_t prbcld_signo;
 /* REFERENCED */
 static intgen_t sigstray_received;
 static bool_t progrpt_enabledpr;
@@ -167,6 +153,8 @@ main( int argc, char *argv[] )
 	intgen_t exitcode;
 	rlim64_t tmpstacksz;
 	struct sigaction sa;
+	intgen_t prbcld_xc = EXIT_NORMAL;
+	intgen_t xc;
 	bool_t ok;
 	/* REFERENCED */
 	int rval;
@@ -195,10 +183,10 @@ main( int argc, char *argv[] )
 	*/
 	mlog_init0();
 
-	/* Get the parent's pid. will be used in signal handling
+	/* Get the parent's pthread id. will be used
 	 * to differentiate parent from children.
 	 */
-	parentpid = getpid( );
+	parenttid = pthread_self( );
 	rval = atexit(mlog_exit_flush);
 	assert(rval == 0);
 
@@ -216,16 +204,11 @@ main( int argc, char *argv[] )
 	if ( ! ok ) {
 		return mlog_exit(EXIT_ERROR, RV_INIT);
 	}
-	/* scan the command line for the miniroot, info, progress
+	/* scan the command line for the info, progress
 	 * report options, and stacksz.
 	 */
 	minstacksz = MINSTACKSZ;
 	maxstacksz = MAXSTACKSZ;
-#ifdef HIDDEN
-	miniroot = BOOL_FALSE;
-#else
-	miniroot = BOOL_TRUE;
-#endif /* HIDDEN */
 	infoonly = BOOL_FALSE;
 	progrpt_enabledpr = BOOL_FALSE;
 	optind = 1;
@@ -276,9 +259,6 @@ main( int argc, char *argv[] )
 			}
 			maxstacksz = tmpstacksz;
 			break;
-                case GETOPT_MINIROOT:
-                        miniroot = BOOL_TRUE;
-                        break;
 		case GETOPT_HELP:
 			infoonly = BOOL_TRUE;
 			mlog_exit_hint(RV_USAGE);
@@ -350,20 +330,6 @@ main( int argc, char *argv[] )
 		return mlog_exit(EXIT_ERROR, RV_INIT);
 	}
 
-	/* perform an experiment to determine if we are in the miniroot.
-	 * various features will be disallowed if in miniroot.
-	 */
-	if ( ! miniroot && in_miniroot_heuristic( )) {
-		miniroot = BOOL_TRUE;
-	}
-
-	/* initialize the spinlock allocator
-	 */
-	ok = qlock_init( miniroot );
-	if ( ! ok ) {
-		return mlog_exit(EXIT_ERROR, RV_INIT);
-	}
-
 	/* initialize message logging (stage 2) - allocate the message lock
 	 */
 	ok = mlog_init2( );
@@ -402,11 +368,11 @@ main( int argc, char *argv[] )
 	ASSERT( ( intgen_t )pgsz > 0 );
 	pgmask = pgsz - 1;
 
-	/* report parent pid
+	/* report parent tid
          */
 	mlog( MLOG_DEBUG | MLOG_PROC,
-	      "parent pid is %d\n",
-	      parentpid );
+	      "parent tid is %lu\n",
+	      parenttid );
 
 	/* get the current working directory: this is where we will dump
 	 * core, if necessary. some tmp files may be placed here as well.
@@ -432,10 +398,8 @@ main( int argc, char *argv[] )
 	 */
 	if ( infoonly ) {
 		mlog( MLOG_NORMAL,
-		      _("version %s (dump format %d.%d)\n"),
-		      VERSION,
-		      version,
-		      subversion );
+		      _("version %s (dump format %d.0)\n"),
+		      VERSION, GLOBAL_HDR_VERSION );
 		usage( );
 		return mlog_exit(EXIT_NORMAL, RV_OK); /* normal termination */
 	}
@@ -481,7 +445,7 @@ main( int argc, char *argv[] )
 	 * terribly time-consuming here. A second initialization pass
 	 * will be done shortly.
 	 */
-	ok = drive_init1( argc, argv, miniroot );
+	ok = drive_init1( argc, argv );
 	if ( ! ok ) {
 		return mlog_exit(EXIT_ERROR, RV_INIT);
 	}
@@ -507,15 +471,9 @@ main( int argc, char *argv[] )
 	 */
 	sistr = sigintstr( );
 	mlog( MLOG_VERBOSE,
-	      _("version %s (dump format %d.%d)"),
-	      VERSION,
-	      version,
-	      subversion );
-	if ( miniroot ) {
-		mlog( MLOG_VERBOSE | MLOG_BARE, _(
-		      " - "
-		      "Running single-threaded\n") );
-	} else if ( ! pipeline && ! stdoutpiped && sistr && dlog_allowed( )) {
+	      _("version %s (dump format %d.0)"),
+	      VERSION, GLOBAL_HDR_VERSION );
+	if ( ! pipeline && ! stdoutpiped && sistr && dlog_allowed( )) {
 		mlog( MLOG_VERBOSE | MLOG_BARE, _(
 		      " - "
 		      "type %s for status and control\n"),
@@ -539,11 +497,17 @@ main( int argc, char *argv[] )
 	 */
 	mlog_tell_streamcnt( drivecnt );
 
-	/* initialize the state of signal processing. if miniroot or
-	 * pipeline, just want to exit when a signal is received. otherwise,
-	 * hold signals so they don't interfere with sys calls; they will
-	 * be released at pre-emption points and upon pausing in the main
-	 * loop.
+	/* initialize the state of signal processing. if in a pipeline, just
+	 * want to exit when a signal is received. otherwise, hold signals so
+	 * they don't interfere with sys calls; they will be released at
+	 * pre-emption points and upon pausing in the main loop.
+	 *
+	 * note that since we're multi-threaded, handling SIGCHLD causes
+	 * problems with system()'s ability to obtain a child's exit status
+	 * (because the main thread may process SIGCHLD before the thread
+	 * running system() calls waitpid()). likewise explicitly ignoring
+	 * SIGCHLD also prevents system() from getting an exit status.
+	 * therefore we don't do anything with SIGCHLD.
 	 */
 
 	sigfillset(&sa.sa_mask);
@@ -551,15 +515,11 @@ main( int argc, char *argv[] )
 
 	/* always ignore SIGPIPE, instead handle EPIPE as part
 	 * of normal sys call error handling.
-	 *
-	 * explicitly ignore SIGCHLD so that if librmt rsh sessions
-	 * exit early they do not become zombies.
 	 */
 	sa.sa_handler = SIG_IGN;
 	sigaction( SIGPIPE, &sa, NULL );
-	sigaction( SIGCHLD, &sa, NULL );
 
-	if ( ! miniroot && ! pipeline ) {
+	if ( ! pipeline ) {
 		sigset_t blocked_set;
 
 		stop_in_progress = BOOL_FALSE;
@@ -569,7 +529,6 @@ main( int argc, char *argv[] )
 		sigint_received = BOOL_FALSE;
 		sigquit_received = BOOL_FALSE;
 		sigstray_received = BOOL_FALSE;
-		prbcld_cnt = 0;
 
 		alarm( 0 );
 
@@ -579,7 +538,8 @@ main( int argc, char *argv[] )
 		sigaddset( &blocked_set, SIGTERM );
 		sigaddset( &blocked_set, SIGQUIT );
 		sigaddset( &blocked_set, SIGALRM );
-		sigprocmask( SIG_SETMASK, &blocked_set, NULL );
+		sigaddset( &blocked_set, SIGUSR1 );
+		pthread_sigmask( SIG_SETMASK, &blocked_set, NULL );
 
 		sa.sa_handler = sighandler;
 		sigaction( SIGINT, &sa, NULL );
@@ -587,6 +547,7 @@ main( int argc, char *argv[] )
 		sigaction( SIGTERM, &sa, NULL );
 		sigaction( SIGQUIT, &sa, NULL );
 		sigaction( SIGALRM, &sa, NULL );
+		sigaction( SIGUSR1, &sa, NULL );
 	}
 
 	/* do content initialization.
@@ -601,10 +562,9 @@ main( int argc, char *argv[] )
 		return mlog_exit(EXIT_ERROR, RV_INIT);
 	}
 
-	/* if miniroot or a pipeline, go single-threaded
-	 * with just one stream.
+	/* if in a pipeline, go single-threaded with just one stream.
 	 */
-	if ( miniroot || pipeline ) {
+	if ( pipeline ) {
 		intgen_t exitcode;
 
 		sa.sa_handler = sighandler;
@@ -683,7 +643,6 @@ main( int argc, char *argv[] )
 	if ( ! init_error ) {
 		for ( stix = 0 ; stix < drivecnt ; stix++ ) {
 			ok = cldmgr_create( childmain,
-					    CLONE_VM,
 					    stix,
 					    "child",
 					    ( void * )stix );
@@ -717,31 +676,16 @@ main( int argc, char *argv[] )
 		 * stop. furthermore, note that core should be dumped if
 		 * the child explicitly exited with EXIT_FAULT.
 		 */
-		if ( prbcld_cnt ) {
-			if ( prbcld_xc == EXIT_FAULT || prbcld_signo != 0 ) {
+		xc = cldmgr_join( );
+		if ( xc ) {
+			if ( xc == EXIT_FAULT ) {
 				coredump_requested = BOOL_TRUE;
 				stop_timeout = ABORT_TIMEOUT;
 			} else {
 				stop_timeout = STOP_TIMEOUT;
 			}
+			prbcld_xc = xc;
 			stop_requested = BOOL_TRUE;
-			if ( prbcld_xc != EXIT_NORMAL ) {
-				mlog( MLOG_DEBUG | MLOG_PROC,
-				      "child (pid %d) requested stop: "
-				      "exit code %d (%s)\n",
-				      prbcld_pid,
-				      prbcld_xc,
-				      exit_codestring( prbcld_xc ));
-			} else if ( prbcld_signo ) {
-				ASSERT( prbcld_signo );
-				mlog( MLOG_NORMAL | MLOG_ERROR | MLOG_PROC,
-				      _("child (pid %d) faulted: "
-				      "signal number %d (%s)\n"),
-				      prbcld_pid,
-				      prbcld_signo,
-				      sig_numstring( prbcld_signo ));
-			}
-			prbcld_cnt = 0;
 		}
 			
 		/* all children died normally. break out.
@@ -902,7 +846,7 @@ main( int argc, char *argv[] )
 	if ( coredump_requested ) {
 		mlog( MLOG_DEBUG | MLOG_PROC,
 		      "core dump requested, aborting (pid %d)\n",
-		      parentpid );
+		      getpid() );
 		abort();
 	}
 
@@ -974,6 +918,7 @@ usage( void )
 #ifdef REVEAL
 	ULO(_("(generate tape record checksums)"),	GETOPT_RECCHKSUM );
 #endif /* REVEAL */
+	ULO(_("(skip unchanged directories)"),		GETOPT_NOUNCHANGEDDIRS );
 	ULO(_("(pre-erase media)"),			GETOPT_ERASE );
 	ULO(_("(don't prompt)"),			GETOPT_FORCE );
 #ifdef REVEAL
@@ -982,6 +927,7 @@ usage( void )
 #endif /* REVEAL */
 	ULO(_("(display dump inventory)"),		GETOPT_INVPRINT );
 	ULO(_("(inhibit inventory update)"),		GETOPT_NOINVUPDATE );
+	ULO(_("(generate format 2 dump)"),		GETOPT_FMT2COMPAT );
 	ULO(_("<session label>"),			GETOPT_DUMPLABEL );
 	ULO(_("<media label> ..."),			GETOPT_MEDIALABEL );
 #ifdef REVEAL
@@ -999,9 +945,6 @@ usage( void )
 	ULO(_("(show verbosity in messages)"),		GETOPT_SHOWLOGLEVEL );
 #endif /* REVEAL */
 	ULO(_("<I/O buffer ring length>"),		GETOPT_RINGLEN );
-#ifdef REVEAL
-	ULO(_("(miniroot restrictions)"),		GETOPT_MINIROOT );
-#endif /* REVEAL */
 	ULN(_("- (stdout)") );
 	ULN(_("<source (mntpnt|device)>") );
 #endif /* DUMP */
@@ -1033,6 +976,7 @@ usage( void )
 	ULO(_("(don't prompt)"),			GETOPT_FORCE );
 	ULO(_("(display dump inventory)"),		GETOPT_INVPRINT );
 	ULO(_("(inhibit inventory update)"),		GETOPT_NOINVUPDATE );
+	ULO(_("(force use of format 2 generation numbers)"),GETOPT_FMT2COMPAT );
 	ULO(_("<session label>"),			GETOPT_DUMPLABEL );
 #ifdef REVEAL
 	ULO(_("(timestamp messages)"),			GETOPT_TIMESTAMP );
@@ -1052,9 +996,6 @@ usage( void )
 #endif /* REVEAL */
 	ULO(_("<excluded subtree> ..."),		GETOPT_NOSUBTREE );
 	ULO(_("<I/O buffer ring length>"),		GETOPT_RINGLEN );
-#ifdef REVEAL
-	ULO(_("(miniroot restrictions)"),		GETOPT_MINIROOT );
-#endif /* REVEAL */
 	ULN(_("- (stdin)") );
 	ULN(_("<destination>") );
 #endif /* RESTORE */
@@ -1103,9 +1044,9 @@ preemptchk( int flg )
 		return BOOL_FALSE;
 	}
 
-	/* signals not caught in these cases
+	/* signals not caught if in a pipeline
 	 */
-	if ( miniroot || pipeline ) {
+	if ( pipeline ) {
 		return BOOL_FALSE;
 	}
 
@@ -1422,66 +1363,6 @@ loadoptfile( intgen_t *argcp, char ***argvp )
 	return BOOL_TRUE;
 }
 
-#ifdef HIDDEN
-static pid_t mrh_cid;
-#endif
-
-static bool_t
-in_miniroot_heuristic( void )
-{
-	return BOOL_TRUE;
-
-#ifdef HIDDEN
-	SIG_PF prev_handler_hup;
-	SIG_PF prev_handler_term;
-	SIG_PF prev_handler_int;
-	SIG_PF prev_handler_quit;
-	SIG_PF prev_handler_cld;
-	bool_t in_miniroot;
-
-	/* attempt to call sproc.
-	 */
-	prev_handler_hup = sigset( SIGHUP, SIG_IGN );
-	prev_handler_term = sigset( SIGTERM, SIG_IGN );
-	prev_handler_int = sigset( SIGINT, SIG_IGN );
-	prev_handler_quit = sigset( SIGQUIT, SIG_IGN );
-	prev_handler_cld = sigset( SIGCLD, mrh_sighandler );
-	( void )sighold( SIGCLD );
-	mrh_cid = ( pid_t )sproc( ( void ( * )( void * ))exit, PR_SALL, 0 );
-	if ( mrh_cid < 0 ) {
-		in_miniroot = BOOL_TRUE;
-	} else {
-		while ( mrh_cid >= 0 ) {
-			( void )sigpause( SIGCLD );
-		}
-		in_miniroot = BOOL_FALSE;
-	}
-	( void )sigset( SIGHUP, prev_handler_hup );
-	( void )sigset( SIGTERM, prev_handler_term );
-	( void )sigset( SIGINT, prev_handler_int );
-	( void )sigset( SIGQUIT, prev_handler_quit );
-	( void )sigset( SIGCLD, prev_handler_cld );
-
-	return in_miniroot;
-#endif /* HIDDEN */
-}
-
-#ifdef HIDDEN
-static void
-mrh_sighandler( int signo )
-{
-	if ( signo == SIGCLD ) {
-		pid_t cid;
-		intgen_t stat;
-
-		cid = wait( &stat );
-		if ( cid == mrh_cid ) {
-			mrh_cid = -1;
-		}
-	}
-}
-#endif
-
 /* parent and children share this handler. 
  */
 static void
@@ -1492,9 +1373,9 @@ sighandler( int signo )
 	if ( dlog_sighandler( signo ) )
 		return;
 
-	/* if in miniroot, don't do anything risky. just quit.
+	/* if in pipeline, don't do anything risky. just quit.
 	 */
-	if ( miniroot || pipeline ) {
+	if ( pipeline ) {
 		intgen_t rval;
 
 		mlog( MLOG_TRACE | MLOG_NOTE | MLOG_NOLOCK | MLOG_PROC,
@@ -1534,6 +1415,7 @@ sighandler( int signo )
 		sigquit_received = BOOL_TRUE;
 		break;
 	case SIGALRM:
+	case SIGUSR1:
 		break;
 	default:
 		sigstray_received = signo;
@@ -1566,7 +1448,7 @@ childmain( void *arg1 )
 	drivep = drivepp[ stix ];
 	( * drivep->d_opsp->do_quit )( drivep );
 
-	exit( exitcode );
+	return exitcode;
 }
 
 

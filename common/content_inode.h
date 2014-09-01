@@ -130,6 +130,7 @@ typedef struct content_inode_hdr content_inode_hdr_t;
 #define CIH_DUMPATTR_DIRENTHDR_GEN		( 1 << 11 )
 #define CIH_DUMPATTR_EXTATTR			( 1 << 12 )
 #define CIH_DUMPATTR_EXTATTRHDR_CHECKSUM	( 1 << 13 )
+#define CIH_DUMPATTR_NOTSELFCONTAINED		( 1 << 14 )
 
 
 /* timestruct_t - time structure
@@ -172,8 +173,10 @@ struct bstat {				/*		     bytes accum */
 	int32_t		bs_extsize;	/* extent size		 4    50 */
 	int32_t		bs_extents;	/* number of extents	 4    54 */
 	u_int32_t	bs_gen;		/* generation count	 4    58 */
-	u_int16_t	bs_projid;	/* project id		 2    5a */
-	char		bs_pad[ 14 ];	/* for expansion	 e    68 */
+	u_int16_t	bs_projid_lo;	/* low 16 of project id	 2    5a */
+	u_int16_t	bs_forkoff;	/* inode fork offset	 2    5c */
+	u_int16_t	bs_projid_hi;	/* hi 16 of project id	 2    5e */
+	char		bs_pad[ 10 ];	/* for expansion	 e    68 */
 	u_int32_t	bs_dmevmask;	/* DMI event mask        4    6c */
 	u_int16_t	bs_dmstate;	/* DMI state info        2    6e */
 	char		bs_pad1[ 18 ];	/* for expansion        12    80 */
@@ -182,6 +185,18 @@ struct bstat {				/*		     bytes accum */
 };
 
 typedef struct bstat bstat_t;
+
+/*
+ * Project quota id helpers (previously projid was 16bit only
+ * and using two 16bit values to hold new 32bit projid was choosen
+ * to retain compatibility with "old" filesystems).
+ */
+static inline __uint32_t
+bstat_projid(struct bstat *bs)
+{
+        return (__uint32_t)bs->bs_projid_hi << 16 | bs->bs_projid_lo;
+}
+
 
 /* extended inode flags that can only be set after all data
  * has been restored to a file.
@@ -283,11 +298,27 @@ typedef struct extenthdr extenthdr_t;
  * a sequence of directory entries is always terminated with a null direnthdr_t.
  * this is detected by looking for a zero ino.
  */
+typedef u_int32_t gen_t;
+
 #define DIRENTHDR_ALIGN	8
 
 #define DIRENTHDR_SZ	24
 
 struct direnthdr {
+	xfs_ino_t dh_ino;
+	gen_t dh_gen;
+	u_int32_t dh_checksum;
+	u_int16_t dh_sz; /* overall size of record */
+	char dh_name[ 6 ];
+};
+
+typedef struct direnthdr direnthdr_t;
+
+/* the old direnthdr truncated the inode generation number
+ * to the low 12 bits.
+ */
+
+struct direnthdr_v1 {
 	xfs_ino_t dh_ino;
 	u_int16_t dh_gen; /* generation count & DENTGENMASK of ref'ed inode */
 	u_int16_t dh_sz; /* overall size of record */
@@ -295,14 +326,12 @@ struct direnthdr {
 	char dh_name[ 8 ];
 };
 
-typedef struct direnthdr direnthdr_t;
+typedef struct direnthdr_v1 direnthdr_v1_t;
 
 /* truncated generation count
  */
 #define DENTGENSZ		12	/* leave 4 bits for future flags */
 #define DENTGENMASK		(( 1 << DENTGENSZ ) - 1 )
-typedef u_int16_t gen_t;
-#define GEN_NULL		( ( gen_t )UINT16MAX )
 #define BIGGEN2GEN( bg )	( ( gen_t )( bg & DENTGENMASK ))
 
 
